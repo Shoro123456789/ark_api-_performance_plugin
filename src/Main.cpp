@@ -224,11 +224,11 @@ namespace PerfGuard
 		}
 
 		// sanity limits so a typo can't make the plugin hammer the server
-		c.reportIntervalSeconds = std::max(30, c.reportIntervalSeconds);
-		c.capCheckIntervalSeconds = std::max(60, c.capCheckIntervalSeconds);
-		c.cleanupIntervalSeconds = std::max(60, c.cleanupIntervalSeconds);
-		c.autoHeadroomPercent = std::max(5, c.autoHeadroomPercent);
-		c.autoBaselineEndMinutes = std::max(c.autoBaselineStartMinutes + 1, c.autoBaselineEndMinutes);
+		c.reportIntervalSeconds = (std::max)(30, c.reportIntervalSeconds);
+		c.capCheckIntervalSeconds = (std::max)(60, c.capCheckIntervalSeconds);
+		c.cleanupIntervalSeconds = (std::max)(60, c.cleanupIntervalSeconds);
+		c.autoHeadroomPercent = (std::max)(5, c.autoHeadroomPercent);
+		c.autoBaselineEndMinutes = (std::max)(c.autoBaselineStartMinutes + 1, c.autoBaselineEndMinutes);
 		c.maxRemovalsPerPass = std::clamp(c.maxRemovalsPerPass, 1, 2000);
 		c.maxCleanupPerPass = std::clamp(c.maxCleanupPerPass, 1, 2000);
 		c.saveToExitDelaySeconds = std::clamp(c.saveToExitDelaySeconds, 5, 600);
@@ -308,7 +308,7 @@ namespace PerfGuard
 	{
 		double best = 1.0e12;
 		for (const FVector& p : players)
-			best = std::min(best, static_cast<double>(FVector::Distance(at, p)));
+			best = (std::min)(best, static_cast<double>(FVector::Distance(at, p)));
 		return best;
 	}
 
@@ -423,7 +423,7 @@ namespace PerfGuard
 
 		g_window.frames++;
 		g_window.sumMs += ms;
-		g_window.maxMs = std::max(g_window.maxMs, ms);
+		g_window.maxMs = (std::max)(g_window.maxMs, ms);
 		if (ms > 50.0) g_window.over50++;
 		if (ms > 100.0) g_window.over100++;
 		if (ms > 250.0) g_window.over250++;
@@ -516,7 +516,7 @@ namespace PerfGuard
 		const double mins = MinutesSinceReady();
 		if (mins < g_cfg.autoBaselineStartMinutes)
 			return;
-		g_baseline = std::max(g_baseline, wildLiving);
+		g_baseline = (std::max)(g_baseline, wildLiving);
 		if (mins >= g_cfg.autoBaselineEndMinutes)
 		{
 			g_baselineLocked = true;
@@ -767,7 +767,7 @@ namespace PerfGuard
 	void AnnounceCountdown()
 	{
 		const double left = std::difftime(g_restart.exitAt, std::time(nullptr));
-		const int mins = std::max(0, static_cast<int>(std::ceil(left / 60.0)));
+		const int mins = (std::max)(0, static_cast<int>(std::ceil(left / 60.0)));
 		for (int w : g_cfg.warningMinutes)
 			if (w >= mins)
 				g_restart.warned.insert(w); // don't repeat warnings for times already covered by this message
