@@ -1,0 +1,10 @@
+{
+  "name": "perfguard",
+  "version": "1.0.0",
+  "dependencies": [
+    {
+      "name": "fmt"
+    }
+  ],
+  "builtin-baseline": "ed8445dd2a9ba44e0e3ace4e952b2e33130082d9"
+}

@@ -1,0 +1,101 @@
+{
+  "Monitor": {
+    "Enabled": true,
+    "ReportIntervalSeconds": 300,
+    "CountActorsInReport": true,
+    "HitchLogMs": 500
+  },
+  "WildDinoCap": {
+    "Enabled": true,
+    "DryRun": true,
+    "MaxWildDinos": 0,
+    "AutoBaselineStartMinutes": 10,
+    "AutoBaselineEndMinutes": 30,
+    "AutoHeadroomPercent": 20,
+    "PerSpeciesMax": 0,
+    "CheckIntervalSeconds": 600,
+    "MinDistanceFromPlayers": 20000,
+    "MaxRemovalsPerPass": 150,
+    "ExcludeSpecies": []
+  },
+  "Cleanup": {
+    "Enabled": true,
+    "DryRun": true,
+    "IntervalSeconds": 300,
+    "CorpseMaxAgeMinutes": 20,
+    "DroppedItemMaxAgeMinutes": 60,
+    "IncludePlayerDroppedItems": false,
+    "MinDistanceFromPlayers": 15000,
+    "MaxPerPass": 200
+  },
+  "ScheduledRestart": {
+    "Enabled": false,
+    "Times": [
+      "05:00"
+    ],
+    "WarningMinutes": [
+      30,
+      15,
+      10,
+      5,
+      1
+    ],
+    "SaveToExitDelaySeconds": 30
+  },
+  "CVars": {
+    "Enabled": true,
+    "ReapplyMinutes": 0,
+    "List": [
+      {
+        "Command": "a.URO.Enable 1",
+        "Enabled": true,
+        "Note": "Animation update-rate optimisation (usually already on)"
+      },
+      {
+        "Command": "a.ParallelAnimUpdate 1",
+        "Enabled": true,
+        "Note": "Run animation update on worker threads instead of the game thread"
+      },
+      {
+        "Command": "a.ParallelAnimEvaluation 1",
+        "Enabled": true,
+        "Note": "Run animation evaluation on worker threads"
+      },
+      {
+        "Command": "a.ParallelAnimInterpolation 1",
+        "Enabled": true,
+        "Note": "Run animation interpolation on worker threads"
+      },
+      {
+        "Command": "net.UseAdaptiveNetUpdateFrequency 1",
+        "Enabled": false,
+        "Note": "EXPERIMENTAL: replicate idle actors less often"
+      },
+      {
+        "Command": "tick.AllowAsyncTickDispatch 1",
+        "Enabled": false,
+        "Note": "EXPERIMENTAL: dispatch tick tasks from worker threads"
+      },
+      {
+        "Command": "tick.AllowAsyncTickCleanup 1",
+        "Enabled": false,
+        "Note": "EXPERIMENTAL: clean up tick tasks on worker threads"
+      },
+      {
+        "Command": "gc.AllowIncrementalReachability 1",
+        "Enabled": false,
+        "Note": "EXPERIMENTAL: spread GC marking over frames. Conflicts with PerformaceGC GC settings"
+      },
+      {
+        "Command": "gc.IncrementalReachabilityTimeLimit 0.005",
+        "Enabled": false,
+        "Note": "EXPERIMENTAL: 5 ms GC budget per frame"
+      },
+      {
+        "Command": "gc.AllowIncrementalGather 1",
+        "Enabled": false,
+        "Note": "EXPERIMENTAL: spread GC gather over frames"
+      }
+    ]
+  }
+}

@@ -1,0 +1,98 @@
+name: Build PerfGuard
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      asaapi_tag:
+        description: "AsaApi release tag to build against (blank = ASAAPI_VERSION file)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick AsaApi version
+        id: ver
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event.inputs.asaapi_tag }}"
+          if (-not $tag) { $tag = (Get-Content ASAAPI_VERSION -Raw).Trim() }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          Write-Host "Building against AsaApi $tag"
+
+      - name: Fetch AsaApi headers
+        shell: pwsh
+        run: git clone --depth 1 --branch "${{ steps.ver.outputs.tag }}" https://github.com/ArkServerApi/AsaApi.git extern/AsaApi
+
+      - name: Get AsaApi.lib
+        shell: pwsh
+        run: |
+          $dest = "extern/AsaApi/out_lib"
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          if (Test-Path lib/AsaApi.lib) {
+            Copy-Item lib/AsaApi.lib "$dest/AsaApi.lib"
+            Write-Host "Using lib/AsaApi.lib from the repository"
+            exit 0
+          }
+          New-Item -ItemType Directory -Force rel | Out-Null
+          gh release download "${{ steps.ver.outputs.tag }}" --repo ArkServerApi/AsaApi --dir rel
+          if ($LASTEXITCODE -ne 0) { Write-Host "No downloadable release assets for this tag" }
+          Get-ChildItem rel -Filter *.zip -ErrorAction SilentlyContinue | ForEach-Object {
+            Expand-Archive $_.FullName -DestinationPath ("rel/" + $_.BaseName) -Force
+          }
+          $lib = Get-ChildItem rel -Recurse -Filter AsaApi.lib -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $lib) {
+            Write-Error "AsaApi.lib not found in the GitHub release. Copy Lib\AsaApi.lib from the AsaApi zip you installed on the server into this repo as lib/AsaApi.lib and push again."
+            exit 1
+          }
+          Copy-Item $lib.FullName "$dest/AsaApi.lib"
+          Write-Host "Using $($lib.FullName)"
+
+      - name: Set up vcpkg
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git "$env:RUNNER_TEMP/vcpkg"
+          & "$env:RUNNER_TEMP/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
+          & "$env:RUNNER_TEMP/vcpkg/vcpkg.exe" integrate install
+          "VCPKG_ROOT=$env:RUNNER_TEMP\vcpkg" >> $env:GITHUB_ENV
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build
+        shell: pwsh
+        run: msbuild PerfGuard.sln /m /p:Configuration=Release /p:Platform=x64 /p:VcpkgRoot="$env:VCPKG_ROOT\" /p:VcpkgEnableManifest=true
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $pkg = "package/PerfGuard"
+          New-Item -ItemType Directory -Force $pkg | Out-Null
+          Copy-Item out/PerfGuard.dll $pkg
+          Copy-Item configs/PluginInfo.json $pkg
+          Copy-Item configs/config.json $pkg
+          Copy-Item README.md package/
+          Compress-Archive -Path package/* -DestinationPath PerfGuard.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PerfGuard
+          path: |
+            package/
+            out/PerfGuard.pdb
+
+      - name: Publish release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: gh release create "${{ github.ref_name }}" PerfGuard.zip --title "PerfGuard ${{ github.ref_name }}" --notes "Built against AsaApi ${{ steps.ver.outputs.tag }}"
