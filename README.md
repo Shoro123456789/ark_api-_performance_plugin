@@ -50,7 +50,7 @@ GitHub Actions builds the plugin on every push to `main` (`.github/workflows/bui
 
 - The headers come from the AsaApi tag in `ASAAPI_VERSION`.
 - `AsaApi.lib` comes from that AsaApi GitHub release. If the release has no zip, copy `Lib/AsaApi.lib` from the AsaApi download you installed on the server to `lib/AsaApi.lib` in this repo.
-- Push a tag like `v1.0.0` to also publish a release.
+- Every push to `main` updates the `latest` release with a ready-to-install `PerfGuard.zip`.
 
 To build locally, use Visual Studio 2022 with the C++ workload. Run `git clone --branch 2.11 https://github.com/ArkServerApi/AsaApi extern/AsaApi`, put `AsaApi.lib` in `extern/AsaApi/out_lib/`, then build `PerfGuard.sln` (Release x64).
 
