@@ -40,7 +40,11 @@
       5,
       1
     ],
-    "SaveToExitDelaySeconds": 30
+    "SaveToExitDelaySeconds": 30,
+    "WindowEnabled": false,
+    "WindowStart": "03:00",
+    "WindowEnd": "07:00",
+    "WindowEmptyForMinutes": 5
   },
   "CVars": {
     "Enabled": true,
@@ -96,6 +100,43 @@
         "Enabled": false,
         "Note": "EXPERIMENTAL: spread GC gather over frames"
       }
+    ]
+  },
+  "Profiler": {
+    "Enabled": true
+  },
+  "DistanceThrottle": {
+    "Enabled": false,
+    "Tier1Distance": 10000,
+    "Tier1EveryNFrames": 3,
+    "Tier2Distance": 25000,
+    "Tier2EveryNFrames": 15,
+    "ScanIntervalSeconds": 3,
+    "MaxAccumulatedSeconds": 1.0,
+    "ThrottleActorTick": true,
+    "ThrottleAI": true,
+    "ThrottleMovement": true,
+    "ThrottleAnimation": true
+  },
+  "IdleMode": {
+    "Enabled": true,
+    "EmptyForSeconds": 120,
+    "IdleMaxFPS": 10,
+    "ActiveMaxFPS": 30
+  },
+  "EmptyServerMaintenance": {
+    "Enabled": true,
+    "EmptyForMinutes": 5,
+    "MinMinutesBetweenGC": 15
+  },
+  "GameThread": {
+    "Priority": 0,
+    "AffinityMask": 0
+  },
+  "LogFilter": {
+    "Enabled": true,
+    "BlockContains": [
+      "CS Cast Failed"
     ]
   }
 }

@@ -7,10 +7,18 @@
 //   3. Stale cleanup      - removes long-dead wild corpses and stuck dropped items far from players.
 //   4. Scheduled restart  - broadcasts warnings, saves, then exits so the panel restarts the server.
 //   5. Engine cvars       - applies a list of console variables at startup, for measured experiments.
+//   6. Profiler           - times the main per-frame game functions and explains every hitch.
+//   7. Distance throttle  - updates wild dinos far from every player only every Nth frame.
+//   8. Idle mode          - lowers the server frame rate while nobody is online.
+//   9. Empty maintenance  - forces garbage collection only while the server is empty.
+//  10. Restart window     - restarts when the server is empty inside a time window.
+//  11. Log filter         - drops Blueprint PrintString spam such as "CS Cast Failed".
+//  12. Game thread        - optional priority and CPU pinning for the main game thread.
 //
 // Everything runs on the game thread (AsaApi tick/timer/RCON callbacks), so no locking is needed.
 
 #include <API/ARK/Ark.h>
+#include <windows.h>
 #include <json.hpp>
 
 #include <algorithm>
@@ -86,6 +94,47 @@ namespace PerfGuard
 		bool cvarsEnabled = true;
 		int cvarsReapplyMinutes = 0; // 0 = only at startup
 		std::vector<CVarEntry> cvars;
+
+		// profiler
+		bool profilerEnabled = true;
+
+		// distance throttle
+		bool throttleEnabled = false;
+		double tier1Distance = 10000.0;  // 100 m
+		int tier1EveryNFrames = 3;
+		double tier2Distance = 25000.0;  // 250 m
+		int tier2EveryNFrames = 15;
+		int throttleScanSeconds = 3;
+		float maxAccumulatedSeconds = 1.0f;
+		bool throttleActorTick = true;
+		bool throttleAI = true;
+		bool throttleMovement = true;
+		bool throttleAnimation = true;
+
+		// idle mode
+		bool idleEnabled = true;
+		int idleEmptyForSeconds = 120;
+		int idleMaxFPS = 10;
+		int activeMaxFPS = 30;
+
+		// empty-server maintenance
+		bool maintEnabled = true;
+		int maintEmptyForMinutes = 5;
+		int maintMinMinutesBetweenGC = 15;
+
+		// restart window (part of ScheduledRestart)
+		bool windowEnabled = false;
+		std::string windowStart = "03:00";
+		std::string windowEnd = "07:00";
+		int windowEmptyForMinutes = 5;
+
+		// game thread
+		int threadPriority = 0;      // 0 = leave, 1 = above normal, 2 = highest, 3 = time critical
+		uint64 threadAffinityMask = 0; // 0 = leave
+
+		// log filter
+		bool logFilterEnabled = true;
+		std::vector<std::string> logBlockContains{"CS Cast Failed"};
 	};
 
 	Config g_cfg;
@@ -137,7 +186,11 @@ namespace PerfGuard
     "Enabled": false,
     "Times": ["05:00"],
     "WarningMinutes": [30, 15, 10, 5, 1],
-    "SaveToExitDelaySeconds": 30
+    "SaveToExitDelaySeconds": 30,
+    "WindowEnabled": false,
+    "WindowStart": "03:00",
+    "WindowEnd": "07:00",
+    "WindowEmptyForMinutes": 5
   },
   "CVars": {
     "Enabled": true,
@@ -154,6 +207,41 @@ namespace PerfGuard
       { "Command": "gc.IncrementalReachabilityTimeLimit 0.005", "Enabled": false, "Note": "EXPERIMENTAL: 5 ms GC budget per frame" },
       { "Command": "gc.AllowIncrementalGather 1",        "Enabled": false, "Note": "EXPERIMENTAL: spread GC gather over frames" }
     ]
+  },
+  "Profiler": {
+    "Enabled": true
+  },
+  "DistanceThrottle": {
+    "Enabled": false,
+    "Tier1Distance": 10000,
+    "Tier1EveryNFrames": 3,
+    "Tier2Distance": 25000,
+    "Tier2EveryNFrames": 15,
+    "ScanIntervalSeconds": 3,
+    "MaxAccumulatedSeconds": 1.0,
+    "ThrottleActorTick": true,
+    "ThrottleAI": true,
+    "ThrottleMovement": true,
+    "ThrottleAnimation": true
+  },
+  "IdleMode": {
+    "Enabled": true,
+    "EmptyForSeconds": 120,
+    "IdleMaxFPS": 10,
+    "ActiveMaxFPS": 30
+  },
+  "EmptyServerMaintenance": {
+    "Enabled": true,
+    "EmptyForMinutes": 5,
+    "MinMinutesBetweenGC": 15
+  },
+  "GameThread": {
+    "Priority": 0,
+    "AffinityMask": 0
+  },
+  "LogFilter": {
+    "Enabled": true,
+    "BlockContains": ["CS Cast Failed"]
   }
 }
 )JSON");
@@ -204,6 +292,54 @@ namespace PerfGuard
 			Read(j, "Times", c.restartTimes);
 			Read(j, "WarningMinutes", c.warningMinutes);
 			Read(j, "SaveToExitDelaySeconds", c.saveToExitDelaySeconds);
+			Read(j, "WindowEnabled", c.windowEnabled);
+			Read(j, "WindowStart", c.windowStart);
+			Read(j, "WindowEnd", c.windowEnd);
+			Read(j, "WindowEmptyForMinutes", c.windowEmptyForMinutes);
+		}
+		if (root.contains("Profiler"))
+			Read(root["Profiler"], "Enabled", c.profilerEnabled);
+		if (root.contains("DistanceThrottle"))
+		{
+			const auto& j = root["DistanceThrottle"];
+			Read(j, "Enabled", c.throttleEnabled);
+			Read(j, "Tier1Distance", c.tier1Distance);
+			Read(j, "Tier1EveryNFrames", c.tier1EveryNFrames);
+			Read(j, "Tier2Distance", c.tier2Distance);
+			Read(j, "Tier2EveryNFrames", c.tier2EveryNFrames);
+			Read(j, "ScanIntervalSeconds", c.throttleScanSeconds);
+			Read(j, "MaxAccumulatedSeconds", c.maxAccumulatedSeconds);
+			Read(j, "ThrottleActorTick", c.throttleActorTick);
+			Read(j, "ThrottleAI", c.throttleAI);
+			Read(j, "ThrottleMovement", c.throttleMovement);
+			Read(j, "ThrottleAnimation", c.throttleAnimation);
+		}
+		if (root.contains("IdleMode"))
+		{
+			const auto& j = root["IdleMode"];
+			Read(j, "Enabled", c.idleEnabled);
+			Read(j, "EmptyForSeconds", c.idleEmptyForSeconds);
+			Read(j, "IdleMaxFPS", c.idleMaxFPS);
+			Read(j, "ActiveMaxFPS", c.activeMaxFPS);
+		}
+		if (root.contains("EmptyServerMaintenance"))
+		{
+			const auto& j = root["EmptyServerMaintenance"];
+			Read(j, "Enabled", c.maintEnabled);
+			Read(j, "EmptyForMinutes", c.maintEmptyForMinutes);
+			Read(j, "MinMinutesBetweenGC", c.maintMinMinutesBetweenGC);
+		}
+		if (root.contains("GameThread"))
+		{
+			const auto& j = root["GameThread"];
+			Read(j, "Priority", c.threadPriority);
+			Read(j, "AffinityMask", c.threadAffinityMask);
+		}
+		if (root.contains("LogFilter"))
+		{
+			const auto& j = root["LogFilter"];
+			Read(j, "Enabled", c.logFilterEnabled);
+			Read(j, "BlockContains", c.logBlockContains);
 		}
 		if (root.contains("CVars"))
 		{
@@ -233,6 +369,18 @@ namespace PerfGuard
 		c.maxCleanupPerPass = std::clamp(c.maxCleanupPerPass, 1, 2000);
 		c.saveToExitDelaySeconds = std::clamp(c.saveToExitDelaySeconds, 5, 600);
 		std::sort(c.warningMinutes.begin(), c.warningMinutes.end(), std::greater<int>());
+		c.tier1EveryNFrames = std::clamp(c.tier1EveryNFrames, 1, 120);
+		c.tier2EveryNFrames = std::clamp(c.tier2EveryNFrames, 1, 600);
+		c.tier2Distance = (std::max)(c.tier2Distance, c.tier1Distance);
+		c.throttleScanSeconds = std::clamp(c.throttleScanSeconds, 1, 60);
+		c.maxAccumulatedSeconds = std::clamp(c.maxAccumulatedSeconds, 0.05f, 5.0f);
+		c.idleMaxFPS = std::clamp(c.idleMaxFPS, 1, 120);
+		c.activeMaxFPS = std::clamp(c.activeMaxFPS, 5, 240);
+		c.idleEmptyForSeconds = (std::max)(10, c.idleEmptyForSeconds);
+		c.maintEmptyForMinutes = (std::max)(1, c.maintEmptyForMinutes);
+		c.maintMinMinutesBetweenGC = (std::max)(1, c.maintMinMinutesBetweenGC);
+		c.windowEmptyForMinutes = (std::max)(1, c.windowEmptyForMinutes);
+		c.threadPriority = std::clamp(c.threadPriority, 0, 3);
 
 		g_cfg = c;
 	}
@@ -402,6 +550,7 @@ namespace PerfGuard
 	};
 
 	TickWindow g_window;
+	double g_lastWorldTickMs = 0.0; // set by the UWorld::Tick hook when the profiler runs
 	Clock::time_point g_lastTick{};
 	bool g_haveLastTick = false;
 	Clock::time_point g_lastHitchLog{};
@@ -433,7 +582,8 @@ namespace PerfGuard
 		if (ms >= g_cfg.hitchLogMs && now - g_lastHitchLog > std::chrono::seconds(10))
 		{
 			g_lastHitchLog = now;
-			Log::GetLog()->warn("Hitch: one frame took {:.0f} ms", ms);
+			Log::GetLog()->warn("Hitch: frame took {:.0f} ms (last world tick {:.0f} ms; the rest is outside the world tick, "
+				"e.g. garbage collection, saving or networking)", ms, g_lastWorldTickMs);
 		}
 	}
 
@@ -873,6 +1023,549 @@ namespace PerfGuard
 		}
 	}
 
+	// ------------------------------------------------------------------------------------------------ profiler
+
+	enum Bucket : int
+	{
+		B_World = 0,   // whole UWorld::Tick (everything below runs inside it)
+		B_DinoTick,    // APrimalDinoCharacter::Tick
+		B_DinoAI,      // APrimalDinoAIController::Tick
+		B_Movement,    // UCharacterMovementComponent::TickComponent (dinos and players)
+		B_PathFollow,  // UPathFollowingComponent::TickComponent
+		B_Anim,        // USkeletalMeshComponent::TickComponent (server-side animation)
+		B_Status,      // UPrimalCharacterStatusComponent::TickStatus (nested inside dino/player tick)
+		B_PlayerTick,  // AShooterCharacter::Tick
+		B_GameMode,    // AShooterGameMode::Tick
+		B_Count
+	};
+	const char* kBucketNames[B_Count] = {"world tick", "dino tick", "dino AI", "movement", "pathfinding", "animation",
+		"status (inside dino/player tick)", "player tick", "game mode"};
+
+	struct BucketStats
+	{
+		int64 ticks = 0;     // QPC ticks in the current report window
+		int64 calls = 0;
+		int64 frameTicks = 0; // QPC ticks in the current frame (for hitch breakdown)
+	};
+	BucketStats g_prof[B_Count];
+	int64 g_profFrames = 0;
+	int64 g_qpcFreq = 1;
+	Clock::time_point g_lastWorldHitchLog{};
+	bool g_tickHooksInstalled = false;
+	bool g_printHookInstalled = false;
+
+	inline int64 Qpc()
+	{
+		LARGE_INTEGER v;
+		QueryPerformanceCounter(&v);
+		return v.QuadPart;
+	}
+
+	inline double TicksToMs(int64 t) { return static_cast<double>(t) * 1000.0 / static_cast<double>(g_qpcFreq); }
+
+	struct ScopedBucket
+	{
+		Bucket b;
+		int64 start;
+		bool on;
+		explicit ScopedBucket(Bucket bucket) : b(bucket), start(0), on(g_cfg.profilerEnabled)
+		{
+			if (on)
+				start = Qpc();
+		}
+		~ScopedBucket()
+		{
+			if (!on)
+				return;
+			const int64 d = Qpc() - start;
+			g_prof[b].ticks += d;
+			g_prof[b].frameTicks += d;
+			g_prof[b].calls++;
+		}
+	};
+
+	std::string ProfileSummary(bool reset)
+	{
+		std::ostringstream s;
+		s.setf(std::ios::fixed);
+		s.precision(2);
+		if (!g_cfg.profilerEnabled || !g_tickHooksInstalled)
+			return "Profiler off (enable Profiler or DistanceThrottle and restart the server)";
+		if (g_profFrames == 0)
+			return "Profiler: no frames yet";
+		const double frames = static_cast<double>(g_profFrames);
+		const double worldMs = TicksToMs(g_prof[B_World].ticks) / frames;
+		s << "Profile, ms per frame over " << g_profFrames << " frames: world tick " << worldMs;
+		for (int i = B_DinoTick; i < B_Count; ++i)
+		{
+			const double ms = TicksToMs(g_prof[i].ticks) / frames;
+			s << " | " << kBucketNames[i] << " " << ms;
+			if (worldMs > 0.0)
+				s << " (" << static_cast<int>(ms * 100.0 / worldMs) << "%, " << (g_prof[i].calls / g_profFrames) << " calls)";
+		}
+		if (reset)
+		{
+			for (auto& b : g_prof)
+				b = BucketStats{};
+			g_profFrames = 0;
+		}
+		return s.str();
+	}
+
+	// ------------------------------------------------------------------------------------------------ distance throttle
+
+	enum Slot : int { S_Actor = 0, S_AI, S_Move, S_Anim, S_Path, S_Count };
+
+	struct ThrottleState
+	{
+		int every = 1;
+		int frame[S_Count]{};
+		float acc[S_Count]{};
+	};
+	std::unordered_map<const void*, ThrottleState> g_throttle; // keyed by dino AND its AI controller
+	int g_throttleTier1 = 0;
+	int g_throttleTier2 = 0;
+	int64 g_throttleSkipped = 0;
+
+	// returns false when this call should be skipped; otherwise dt holds the accumulated delta to pass on
+	inline bool ThrottleAllows(const void* key, Slot slot, float& dt)
+	{
+		if (!g_cfg.throttleEnabled || g_throttle.empty() || key == nullptr)
+			return true;
+		const auto it = g_throttle.find(key);
+		if (it == g_throttle.end())
+			return true;
+		ThrottleState& st = it->second;
+		st.acc[slot] += dt;
+		if (++st.frame[slot] < st.every)
+		{
+			++g_throttleSkipped;
+			return false;
+		}
+		st.frame[slot] = 0;
+		dt = (std::min)(st.acc[slot], g_cfg.maxAccumulatedSeconds);
+		st.acc[slot] = 0.0f;
+		return true;
+	}
+
+	void RebuildThrottle()
+	{
+		if (!g_cfg.throttleEnabled)
+		{
+			g_throttle.clear();
+			g_throttleTier1 = g_throttleTier2 = 0;
+			return;
+		}
+		UWorld* world = World();
+		if (world == nullptr)
+			return;
+
+		const std::vector<FVector> players = LivingPlayerPositions(world);
+		std::unordered_map<const void*, ThrottleState> next;
+		next.reserve(g_throttle.size() + 64);
+		int t1 = 0, t2 = 0;
+
+		for (AActor* a : AllActorsOf<APrimalDinoCharacter>(world))
+		{
+			if (!IsUsable(a))
+				continue;
+			auto* dino = static_cast<APrimalDinoCharacter*>(a);
+			if (dino->TargetingTeamField() >= kTamedTeamMin || dino->IsDead() || dino->bIsBossDino()() || dino->IsTaming() ||
+				dino->TamingTeamIDField() != 0)
+				continue;
+			const double dist = NearestPlayerDistance(dino->GetLocation(), players);
+			int every = 1;
+			if (dist >= g_cfg.tier2Distance)
+			{
+				every = g_cfg.tier2EveryNFrames;
+				++t2;
+			}
+			else if (dist >= g_cfg.tier1Distance)
+			{
+				every = g_cfg.tier1EveryNFrames;
+				++t1;
+			}
+			if (every <= 1)
+				continue;
+
+			// keep partial accumulators when a dino stays in the same tier
+			const auto keep = [&](const void* key) {
+				ThrottleState st;
+				const auto old = g_throttle.find(key);
+				if (old != g_throttle.end() && old->second.every == every)
+					st = old->second;
+				st.every = every;
+				next[key] = st;
+			};
+			keep(dino);
+			if (AController* ctrl = dino->ControllerField().Get())
+				keep(ctrl);
+		}
+		g_throttle.swap(next);
+		g_throttleTier1 = t1;
+		g_throttleTier2 = t2;
+	}
+
+	std::string ThrottleSummary()
+	{
+		std::ostringstream s;
+		if (!g_cfg.throttleEnabled)
+			return "Distance throttle off";
+		s << "Distance throttle: " << g_throttleTier1 << " wild dinos at 1/" << g_cfg.tier1EveryNFrames << " rate, "
+		  << g_throttleTier2 << " at 1/" << g_cfg.tier2EveryNFrames << " rate, " << g_throttleSkipped
+		  << " ticks skipped since last report";
+		return s.str();
+	}
+
+	// ------------------------------------------------------------------------------------------------ hooks
+
+	DECLARE_HOOK(UWorld_Tick, void, UWorld*, DWORD64, float);
+	DECLARE_HOOK(APrimalDinoCharacter_Tick, void, APrimalDinoCharacter*, float);
+	DECLARE_HOOK(APrimalDinoAIController_Tick, void, APrimalDinoAIController*, float);
+	DECLARE_HOOK(UCharacterMovementComponent_TickComponent, void, UCharacterMovementComponent*, float, DWORD64, FActorComponentTickFunction*);
+	DECLARE_HOOK(UPathFollowingComponent_TickComponent, void, UPathFollowingComponent*, float, DWORD64, FActorComponentTickFunction*);
+	DECLARE_HOOK(USkeletalMeshComponent_TickComponent, void, USkeletalMeshComponent*, float, DWORD64, FActorComponentTickFunction*);
+	DECLARE_HOOK(UPrimalCharacterStatusComponent_TickStatus, void, UPrimalCharacterStatusComponent*, float, bool);
+	DECLARE_HOOK(AShooterCharacter_Tick, void, AShooterCharacter*, float);
+	DECLARE_HOOK(AShooterGameMode_Tick, void, AShooterGameMode*, float);
+	DECLARE_HOOK(UKismetSystemLibrary_PrintString, void, UObject*, FString*, bool, bool, FLinearColor*, float, FName);
+
+	void Hook_UWorld_Tick(UWorld* world, DWORD64 tickType, float dt)
+	{
+		if (!g_cfg.profilerEnabled)
+		{
+			UWorld_Tick_original(world, tickType, dt);
+			return;
+		}
+		for (auto& b : g_prof)
+			b.frameTicks = 0;
+		const int64 start = Qpc();
+		UWorld_Tick_original(world, tickType, dt);
+		const int64 d = Qpc() - start;
+		g_prof[B_World].ticks += d;
+		g_prof[B_World].calls++;
+		++g_profFrames;
+		g_lastWorldTickMs = TicksToMs(d);
+
+		const auto now = Clock::now();
+		if (g_lastWorldTickMs >= g_cfg.hitchLogMs && now - g_lastWorldHitchLog > std::chrono::seconds(10))
+		{
+			g_lastWorldHitchLog = now;
+			std::ostringstream s;
+			s.setf(std::ios::fixed);
+			s.precision(0);
+			s << "Hitch inside world tick: " << g_lastWorldTickMs << " ms. Breakdown:";
+			for (int i = B_DinoTick; i < B_Count; ++i)
+				s << " " << kBucketNames[i] << " " << TicksToMs(g_prof[i].frameTicks) << ",";
+			s << " other (Blueprints, structures, network, mods) is the remainder";
+			Log::GetLog()->warn("{}", s.str());
+		}
+	}
+
+	void Hook_APrimalDinoCharacter_Tick(APrimalDinoCharacter* self, float dt)
+	{
+		if (g_cfg.throttleActorTick && !ThrottleAllows(self, S_Actor, dt))
+			return;
+		ScopedBucket sb(B_DinoTick);
+		APrimalDinoCharacter_Tick_original(self, dt);
+	}
+
+	void Hook_APrimalDinoAIController_Tick(APrimalDinoAIController* self, float dt)
+	{
+		if (g_cfg.throttleAI && !ThrottleAllows(self, S_AI, dt))
+			return;
+		ScopedBucket sb(B_DinoAI);
+		APrimalDinoAIController_Tick_original(self, dt);
+	}
+
+	void Hook_UCharacterMovementComponent_TickComponent(UCharacterMovementComponent* self, float dt, DWORD64 tickType,
+		FActorComponentTickFunction* fn)
+	{
+		if (g_cfg.throttleMovement && !ThrottleAllows(self->OwnerPrivateField(), S_Move, dt))
+			return;
+		ScopedBucket sb(B_Movement);
+		UCharacterMovementComponent_TickComponent_original(self, dt, tickType, fn);
+	}
+
+	void Hook_UPathFollowingComponent_TickComponent(UPathFollowingComponent* self, float dt, DWORD64 tickType,
+		FActorComponentTickFunction* fn)
+	{
+		if (g_cfg.throttleAI && !ThrottleAllows(self->OwnerPrivateField(), S_Path, dt))
+			return;
+		ScopedBucket sb(B_PathFollow);
+		UPathFollowingComponent_TickComponent_original(self, dt, tickType, fn);
+	}
+
+	void Hook_USkeletalMeshComponent_TickComponent(USkeletalMeshComponent* self, float dt, DWORD64 tickType,
+		FActorComponentTickFunction* fn)
+	{
+		if (g_cfg.throttleAnimation && !ThrottleAllows(self->OwnerPrivateField(), S_Anim, dt))
+			return;
+		ScopedBucket sb(B_Anim);
+		USkeletalMeshComponent_TickComponent_original(self, dt, tickType, fn);
+	}
+
+	void Hook_UPrimalCharacterStatusComponent_TickStatus(UPrimalCharacterStatusComponent* self, float dt, bool force)
+	{
+		ScopedBucket sb(B_Status);
+		UPrimalCharacterStatusComponent_TickStatus_original(self, dt, force);
+	}
+
+	void Hook_AShooterCharacter_Tick(AShooterCharacter* self, float dt)
+	{
+		ScopedBucket sb(B_PlayerTick);
+		AShooterCharacter_Tick_original(self, dt);
+	}
+
+	void Hook_AShooterGameMode_Tick(AShooterGameMode* self, float dt)
+	{
+		ScopedBucket sb(B_GameMode);
+		AShooterGameMode_Tick_original(self, dt);
+	}
+
+	int64 g_printBlocked = 0;
+
+	void Hook_UKismetSystemLibrary_PrintString(UObject* ctx, FString* text, bool toScreen, bool toLog, FLinearColor* color,
+		float duration, FName key)
+	{
+		if (g_cfg.logFilterEnabled && text != nullptr && !g_cfg.logBlockContains.empty())
+		{
+			const std::string str = text->ToString();
+			for (const auto& pattern : g_cfg.logBlockContains)
+			{
+				if (!pattern.empty() && str.find(pattern) != std::string::npos)
+				{
+					++g_printBlocked;
+					return;
+				}
+			}
+		}
+		UKismetSystemLibrary_PrintString_original(ctx, text, toScreen, toLog, color, duration, key);
+	}
+
+	struct HookDef
+	{
+		const char* name;
+		LPVOID detour;
+		LPVOID* original;
+		bool tickGroup; // false = PrintString
+	};
+
+	std::vector<HookDef> HookList()
+	{
+		return {
+			{"UWorld.Tick(ELevelTick,float)", reinterpret_cast<LPVOID>(&Hook_UWorld_Tick), reinterpret_cast<LPVOID*>(&UWorld_Tick_original), true},
+			{"APrimalDinoCharacter.Tick(float)", reinterpret_cast<LPVOID>(&Hook_APrimalDinoCharacter_Tick),
+				reinterpret_cast<LPVOID*>(&APrimalDinoCharacter_Tick_original), true},
+			{"APrimalDinoAIController.Tick(float)", reinterpret_cast<LPVOID>(&Hook_APrimalDinoAIController_Tick),
+				reinterpret_cast<LPVOID*>(&APrimalDinoAIController_Tick_original), true},
+			{"UCharacterMovementComponent.TickComponent(float,ELevelTick,FActorComponentTickFunction*)",
+				reinterpret_cast<LPVOID>(&Hook_UCharacterMovementComponent_TickComponent),
+				reinterpret_cast<LPVOID*>(&UCharacterMovementComponent_TickComponent_original), true},
+			{"UPathFollowingComponent.TickComponent(float,ELevelTick,FActorComponentTickFunction*)",
+				reinterpret_cast<LPVOID>(&Hook_UPathFollowingComponent_TickComponent),
+				reinterpret_cast<LPVOID*>(&UPathFollowingComponent_TickComponent_original), true},
+			{"USkeletalMeshComponent.TickComponent(float,ELevelTick,FActorComponentTickFunction*)",
+				reinterpret_cast<LPVOID>(&Hook_USkeletalMeshComponent_TickComponent),
+				reinterpret_cast<LPVOID*>(&USkeletalMeshComponent_TickComponent_original), true},
+			{"UPrimalCharacterStatusComponent.TickStatus(float,bool)", reinterpret_cast<LPVOID>(&Hook_UPrimalCharacterStatusComponent_TickStatus),
+				reinterpret_cast<LPVOID*>(&UPrimalCharacterStatusComponent_TickStatus_original), true},
+			{"AShooterCharacter.Tick(float)", reinterpret_cast<LPVOID>(&Hook_AShooterCharacter_Tick),
+				reinterpret_cast<LPVOID*>(&AShooterCharacter_Tick_original), true},
+			{"AShooterGameMode.Tick(float)", reinterpret_cast<LPVOID>(&Hook_AShooterGameMode_Tick),
+				reinterpret_cast<LPVOID*>(&AShooterGameMode_Tick_original), true},
+			{"UKismetSystemLibrary.PrintString(UObject*,FString&,bool,bool,FLinearColor,float,FName)",
+				reinterpret_cast<LPVOID>(&Hook_UKismetSystemLibrary_PrintString),
+				reinterpret_cast<LPVOID*>(&UKismetSystemLibrary_PrintString_original), false},
+		};
+	}
+
+	void InstallHooks()
+	{
+		LARGE_INTEGER f;
+		QueryPerformanceFrequency(&f);
+		g_qpcFreq = f.QuadPart > 0 ? f.QuadPart : 1;
+
+		const bool wantTick = g_cfg.profilerEnabled || g_cfg.throttleEnabled;
+		const bool wantPrint = g_cfg.logFilterEnabled;
+		int ok = 0;
+		for (const auto& h : HookList())
+		{
+			if ((h.tickGroup && !wantTick) || (!h.tickGroup && !wantPrint))
+				continue;
+			if (AsaApi::GetHooks().SetHook(h.name, h.detour, h.original))
+				++ok;
+			else
+				Log::GetLog()->error("Could not hook {}", h.name);
+		}
+		g_tickHooksInstalled = wantTick;
+		g_printHookInstalled = wantPrint;
+		Log::GetLog()->info("Installed {} hook(s) (tick hooks {}, log filter {})", ok, wantTick ? "on" : "off",
+			wantPrint ? "on" : "off");
+	}
+
+	void RemoveHooks()
+	{
+		for (const auto& h : HookList())
+		{
+			if ((h.tickGroup && g_tickHooksInstalled) || (!h.tickGroup && g_printHookInstalled))
+				AsaApi::GetHooks().DisableHook(h.name, h.detour);
+		}
+		g_tickHooksInstalled = g_printHookInstalled = false;
+	}
+
+	// ------------------------------------------------------------------------------------------------ idle mode, maintenance, game thread
+
+	int g_playersOnline = 0;
+	int g_emptySeconds = 0;
+	bool g_idleActive = false;
+	Clock::time_point g_lastMaintGC{};
+	bool g_haveMaintGC = false;
+
+	int CountPlayers(UWorld* world)
+	{
+		if (world == nullptr)
+			return 0;
+		int n = 0;
+		for (TWeakObjectPtr<APlayerController> weak : world->PlayerControllerListField())
+			if (weak.Get() != nullptr)
+				++n;
+		return n;
+	}
+
+	void UpdatePresence()
+	{
+		g_playersOnline = CountPlayers(World());
+		g_emptySeconds = g_playersOnline == 0 ? g_emptySeconds + 1 : 0;
+
+		// idle mode
+		if (g_cfg.idleEnabled)
+		{
+			if (!g_idleActive && g_playersOnline == 0 && g_emptySeconds >= g_cfg.idleEmptyForSeconds)
+			{
+				g_idleActive = true;
+				RunConsoleCommand("t.MaxFPS " + std::to_string(g_cfg.idleMaxFPS));
+				Log::GetLog()->info("Idle mode on: server empty, frame rate capped at {}", g_cfg.idleMaxFPS);
+			}
+			else if (g_idleActive && g_playersOnline > 0)
+			{
+				g_idleActive = false;
+				RunConsoleCommand("t.MaxFPS " + std::to_string(g_cfg.activeMaxFPS));
+				Log::GetLog()->info("Idle mode off: player online, frame rate back to {}", g_cfg.activeMaxFPS);
+			}
+		}
+		else if (g_idleActive)
+		{
+			g_idleActive = false;
+			RunConsoleCommand("t.MaxFPS " + std::to_string(g_cfg.activeMaxFPS));
+		}
+
+		// garbage collection while nobody can notice the freeze
+		if (g_cfg.maintEnabled && g_playersOnline == 0 && g_emptySeconds >= g_cfg.maintEmptyForMinutes * 60)
+		{
+			const auto now = Clock::now();
+			if (!g_haveMaintGC || now - g_lastMaintGC >= std::chrono::minutes(g_cfg.maintMinMinutesBetweenGC))
+			{
+				g_lastMaintGC = now;
+				g_haveMaintGC = true;
+				if (UEngine* engine = Globals::GEngine()())
+				{
+					engine->ForceGarbageCollection(true);
+					Log::GetLog()->info("Empty-server maintenance: full garbage collection requested");
+				}
+			}
+		}
+	}
+
+	void ApplyGameThreadSettings()
+	{
+		if (g_cfg.threadPriority > 0)
+		{
+			const int prio = g_cfg.threadPriority == 1 ? THREAD_PRIORITY_ABOVE_NORMAL
+				: g_cfg.threadPriority == 2 ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_TIME_CRITICAL;
+			const BOOL ok = SetThreadPriority(GetCurrentThread(), prio);
+			Log::GetLog()->info("Game thread priority set to level {}: {}", g_cfg.threadPriority, ok ? "ok" : "refused");
+		}
+		if (g_cfg.threadAffinityMask != 0)
+		{
+			const DWORD_PTR prev = SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(g_cfg.threadAffinityMask));
+			Log::GetLog()->info("Game thread affinity mask set to {}: {}", g_cfg.threadAffinityMask, prev != 0 ? "ok" : "refused");
+		}
+	}
+
+	// restart inside a time window, preferring a moment when the server is empty
+	std::string g_windowDone; // date of the window already handled
+
+	bool ParseHHMM(const std::string& hhmm, int& h, int& m)
+	{
+		const auto colon = hhmm.find(':');
+		if (colon == std::string::npos)
+			return false;
+		try
+		{
+			h = std::stoi(hhmm.substr(0, colon));
+			m = std::stoi(hhmm.substr(colon + 1));
+		}
+		catch (...)
+		{
+			return false;
+		}
+		return h >= 0 && h <= 23 && m >= 0 && m <= 59;
+	}
+
+	void CheckRestartWindow()
+	{
+		if (!g_cfg.restartEnabled || !g_cfg.windowEnabled || g_restart.active)
+			return;
+		int sh, sm, eh, em;
+		if (!ParseHHMM(g_cfg.windowStart, sh, sm) || !ParseHHMM(g_cfg.windowEnd, eh, em))
+			return;
+
+		const std::time_t now = std::time(nullptr);
+		std::tm start = LocalTime(now);
+		start.tm_hour = sh;
+		start.tm_min = sm;
+		start.tm_sec = 0;
+		std::tm end = start;
+		end.tm_hour = eh;
+		end.tm_min = em;
+		std::time_t ts = std::mktime(&start);
+		std::time_t te = std::mktime(&end);
+		if (te <= ts) // window crosses midnight
+		{
+			if (now < te)
+				ts -= 24 * 3600;
+			else
+				te += 24 * 3600;
+		}
+		if (now < ts || now >= te)
+			return;
+
+		std::tm startTm = LocalTime(ts);
+		char day[16];
+		std::strftime(day, sizeof(day), "%Y-%m-%d", &startTm);
+		if (g_windowDone == day)
+			return;
+
+		if (g_playersOnline == 0 && g_emptySeconds >= g_cfg.windowEmptyForMinutes * 60)
+		{
+			g_windowDone = day;
+			StartCountdown(0, "restart window, server empty");
+			return;
+		}
+		const int lead = g_cfg.warningMinutes.empty() ? 1 : g_cfg.warningMinutes.front();
+		if (std::difftime(te, now) <= lead * 60.0)
+		{
+			g_windowDone = day;
+			g_restart.active = true;
+			g_restart.exitAt = te;
+			g_restart.warned.clear();
+			g_restart.saved = false;
+			Log::GetLog()->info("Restart window ending with players online, counting down to {}", g_cfg.windowEnd);
+			AnnounceCountdown();
+		}
+	}
+
 	// ------------------------------------------------------------------------------------------------ timers
 
 	int g_seconds = 0;
@@ -882,6 +1575,8 @@ namespace PerfGuard
 		g_serverReady = true;
 		g_serverReadyAt = Clock::now();
 		const int n = ApplyCVars();
+		ApplyGameThreadSettings();
+		RunConsoleCommand("t.MaxFPS " + std::to_string(g_cfg.activeMaxFPS));
 		Log::GetLog()->info("Server ready. Applied {} console variable(s). Wild cap {}, cleanup {}, restart schedule {}", n,
 			g_cfg.capEnabled ? "on" : "off", g_cfg.cleanupEnabled ? "on" : "off", g_cfg.restartEnabled ? "on" : "off");
 	}
@@ -902,6 +1597,18 @@ namespace PerfGuard
 			{
 				g_lastReport = BuildReport(true);
 				Log::GetLog()->info("{}", g_lastReport);
+				if (g_tickHooksInstalled && g_cfg.profilerEnabled)
+					Log::GetLog()->info("{}", ProfileSummary(true));
+				if (g_cfg.throttleEnabled)
+				{
+					Log::GetLog()->info("{}", ThrottleSummary());
+					g_throttleSkipped = 0;
+				}
+				if (g_printBlocked > 0)
+				{
+					Log::GetLog()->info("Log filter blocked {} PrintString message(s)", g_printBlocked);
+					g_printBlocked = 0;
+				}
 			}
 			if (g_seconds % g_cfg.capCheckIntervalSeconds == 0)
 				RunWildCap(false);
@@ -909,6 +1616,10 @@ namespace PerfGuard
 				RunCleanup(false);
 			if (g_cfg.cvarsReapplyMinutes > 0 && g_seconds % (g_cfg.cvarsReapplyMinutes * 60) == 0)
 				ApplyCVars();
+			if (g_seconds % g_cfg.throttleScanSeconds == 0)
+				RebuildThrottle();
+			UpdatePresence();
+			CheckRestartWindow();
 			CheckSchedule();
 		}
 		catch (const std::exception& e)
@@ -1008,17 +1719,25 @@ namespace PerfGuard
 		Reply(conn, packet, msg + ". Re-applied " + std::to_string(n) + " console variable(s).");
 	}
 
+	void RconProfile(RCONClientConnection* conn, RCONPacket* packet, UWorld*)
+	{
+		std::ostringstream s;
+		s << ProfileSummary(false) << "\n" << ThrottleSummary() << "\nPlayers online " << g_playersOnline << ", idle mode "
+		  << (g_idleActive ? "on" : "off") << ", PrintString blocked " << g_printBlocked;
+		Reply(conn, packet, s.str());
+	}
+
 	void RconHelp(RCONClientConnection* conn, RCONPacket* packet, UWorld*)
 	{
 		Reply(conn, packet,
 			"PerfGuard commands: perf.stats | perf.dinos | perf.cleanup | perf.rebaseline | perf.exec <cmd> | "
-			"perf.restart <minutes>|cancel | perf.reload");
+			"perf.restart <minutes>|cancel | perf.reload | perf.profile");
 	}
 
 	const std::vector<std::pair<const char*, void (*)(RCONClientConnection*, RCONPacket*, UWorld*)>> kRcon = {
 		{"perf.stats", &RconStats},       {"perf.dinos", &RconDinos},   {"perf.cleanup", &RconCleanup},
 		{"perf.rebaseline", &RconRebaseline}, {"perf.exec", &RconExec}, {"perf.restart", &RconRestart},
-		{"perf.reload", &RconReload},     {"perf.help", &RconHelp},
+		{"perf.reload", &RconReload},     {"perf.help", &RconHelp},       {"perf.profile", &RconProfile},
 	};
 } // namespace PerfGuard
 
@@ -1029,6 +1748,7 @@ extern "C" __declspec(dllexport) void Plugin_Init()
 	using namespace PerfGuard;
 	Log::Get().Init(PROJECT_NAME);
 	Log::GetLog()->info("{}", LoadConfig());
+	InstallHooks();
 
 	AsaApi::GetCommands().AddOnTickCallback(FString("PerfGuard.Tick"), &OnTick);
 	AsaApi::GetCommands().AddOnTimerCallback(FString("PerfGuard.Timer"), &OnSecond);
@@ -1042,6 +1762,7 @@ extern "C" __declspec(dllexport) void Plugin_Init()
 extern "C" __declspec(dllexport) void Plugin_Unload()
 {
 	using namespace PerfGuard;
+	RemoveHooks();
 	AsaApi::GetCommands().RemoveOnTickCallback(FString("PerfGuard.Tick"));
 	AsaApi::GetCommands().RemoveOnTimerCallback(FString("PerfGuard.Timer"));
 	for (const auto& [name, fn] : kRcon)
