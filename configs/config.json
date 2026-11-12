@@ -132,11 +132,5 @@
   "GameThread": {
     "Priority": 0,
     "AffinityMask": 0
-  },
-  "LogFilter": {
-    "Enabled": true,
-    "BlockContains": [
-      "CS Cast Failed"
-    ]
   }
 }

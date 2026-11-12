@@ -14,7 +14,6 @@ An [AsaApi](https://github.com/ArkServerApi/AsaApi) plugin for ARK: Survival Asc
 | Idle mode | After 2 minutes with nobody online, caps the server at 10 FPS. Restores 30 FPS as soon as someone connects. | On |
 | Empty-server maintenance | After 5 minutes empty, requests a full garbage collection (at most every 15 minutes), so the freeze never hits a player. | On |
 | Restart window | Restarts the first time the server has been empty for 5 minutes between `WindowStart` and `WindowEnd`. If people play through the window, it counts down with warnings to `WindowEnd`. | Off |
-| Log filter | Drops Blueprint `PrintString` messages containing any `BlockContains` text, e.g. `CS Cast Failed`. | On |
 | Game thread | Optional thread priority (`1` above normal, `2` highest, `3` time critical) and CPU affinity mask for the main game thread. | Off |
 
 ## Install
@@ -46,7 +45,8 @@ An [AsaApi](https://github.com/ArkServerApi/AsaApi) plugin for ARK: Survival Asc
 
 ## Config notes
 
-- **Restart needed for hooks:** turning `Profiler`, `DistanceThrottle` or `LogFilter` on or off in the config needs a server restart. The hooks are installed at load. Their settings, like distances and frame counts, apply on `perf.reload`.
+- **Log filter removed:** v2.0 hooked Blueprint `PrintString` to drop "CS Cast Failed" spam, but that function's layout differs on ARK 97.21 and it crashed the server. To hide the spam, filter the console in the startup command instead: `tail ... | grep --line-buffered -v "CS Cast Failed"`.
+- **Restart needed for hooks:** turning `Profiler` or `DistanceThrottle` on or off in the config needs a server restart. The hooks are installed at load. Their settings, like distances and frame counts, apply on `perf.reload`.
 
 - **Units:** distances are Unreal units, where 100 = 1 m and one foundation = 300.
 - **`WildDinoCap.MaxWildDinos`:** set a fixed cap instead of the learned baseline (0 = automatic).

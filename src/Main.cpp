@@ -12,7 +12,7 @@
 //   8. Idle mode          - lowers the server frame rate while nobody is online.
 //   9. Empty maintenance  - forces garbage collection only while the server is empty.
 //  10. Restart window     - restarts when the server is empty inside a time window.
-//  11. Log filter         - drops Blueprint PrintString spam such as "CS Cast Failed".
+//  11. (removed) Log filter - the PrintString hook crashed on ARK 97.21; filter the console in the startup command instead.
 //  12. Game thread        - optional priority and CPU pinning for the main game thread.
 //
 // Everything runs on the game thread (AsaApi tick/timer/RCON callbacks), so no locking is needed.
@@ -238,10 +238,6 @@ namespace PerfGuard
   "GameThread": {
     "Priority": 0,
     "AffinityMask": 0
-  },
-  "LogFilter": {
-    "Enabled": true,
-    "BlockContains": ["CS Cast Failed"]
   }
 }
 )JSON");
@@ -1228,7 +1224,6 @@ namespace PerfGuard
 	DECLARE_HOOK(UPrimalCharacterStatusComponent_TickStatus, void, UPrimalCharacterStatusComponent*, float, bool);
 	DECLARE_HOOK(AShooterCharacter_Tick, void, AShooterCharacter*, float);
 	DECLARE_HOOK(AShooterGameMode_Tick, void, AShooterGameMode*, float);
-	DECLARE_HOOK(UKismetSystemLibrary_PrintString, void, UObject*, FString*, bool, bool, FLinearColor*, float, FName);
 
 	void Hook_UWorld_Tick(UWorld* world, DWORD64 tickType, float dt)
 	{
@@ -1323,25 +1318,7 @@ namespace PerfGuard
 		AShooterGameMode_Tick_original(self, dt);
 	}
 
-	int64 g_printBlocked = 0;
-
-	void Hook_UKismetSystemLibrary_PrintString(UObject* ctx, FString* text, bool toScreen, bool toLog, FLinearColor* color,
-		float duration, FName key)
-	{
-		if (g_cfg.logFilterEnabled && text != nullptr && !g_cfg.logBlockContains.empty())
-		{
-			const std::string str = text->ToString();
-			for (const auto& pattern : g_cfg.logBlockContains)
-			{
-				if (!pattern.empty() && str.find(pattern) != std::string::npos)
-				{
-					++g_printBlocked;
-					return;
-				}
-			}
-		}
-		UKismetSystemLibrary_PrintString_original(ctx, text, toScreen, toLog, color, duration, key);
-	}
+	int64 g_printBlocked = 0; // log filter disabled: see README (PrintString hook crashed on ARK 97.21)
 
 	struct HookDef
 	{
@@ -1374,9 +1351,6 @@ namespace PerfGuard
 				reinterpret_cast<LPVOID*>(&AShooterCharacter_Tick_original), true},
 			{"AShooterGameMode.Tick(float)", reinterpret_cast<LPVOID>(&Hook_AShooterGameMode_Tick),
 				reinterpret_cast<LPVOID*>(&AShooterGameMode_Tick_original), true},
-			{"UKismetSystemLibrary.PrintString(UObject*,FString&,bool,bool,FLinearColor,float,FName)",
-				reinterpret_cast<LPVOID>(&Hook_UKismetSystemLibrary_PrintString),
-				reinterpret_cast<LPVOID*>(&UKismetSystemLibrary_PrintString_original), false},
 		};
 	}
 
@@ -1387,7 +1361,7 @@ namespace PerfGuard
 		g_qpcFreq = f.QuadPart > 0 ? f.QuadPart : 1;
 
 		const bool wantTick = g_cfg.profilerEnabled || g_cfg.throttleEnabled;
-		const bool wantPrint = g_cfg.logFilterEnabled;
+		const bool wantPrint = false; // PrintString hook removed: its native signature differs on current ARK builds
 		int ok = 0;
 		for (const auto& h : HookList())
 		{
