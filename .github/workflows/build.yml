@@ -15,6 +15,11 @@ on:
 permissions:
   contents: write
 
+# a newer push cancels an older build so an old zip can't overwrite the latest release
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-2022
