@@ -14,6 +14,7 @@
 //  10. Restart window     - restarts when the server is empty inside a time window.
 //  11. (removed) Log filter - the PrintString hook crashed on ARK 97.21; filter the console in the startup command instead.
 //  12. Game thread        - optional priority and CPU pinning for the main game thread.
+//  13. Experimental threading - runs chosen wild-dino ticks on worker threads (bRunOnAnyThread). Expect crashes.
 //
 // Everything runs on the game thread (AsaApi tick/timer/RCON callbacks), so no locking is needed.
 
@@ -22,6 +23,10 @@
 #include <json.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <filesystem>
+#include <mutex>
+#include <shared_mutex>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -29,6 +34,7 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include <unordered_set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -131,6 +137,16 @@ namespace PerfGuard
 		// game thread
 		int threadPriority = 0;      // 0 = leave, 1 = above normal, 2 = highest, 3 = time critical
 		uint64 threadAffinityMask = 0; // 0 = leave
+
+		// experimental threading
+		bool mtEnabled = false;
+		bool mtDinoActorTick = true;
+		bool mtDinoController = true;
+		bool mtDinoMovement = false;
+		bool mtDinoMesh = false;
+		bool mtIncludeTamed = false;
+		double mtOnlyBeyondDistance = 0.0;
+		int mtScanSeconds = 10;
 
 		// log filter
 		bool logFilterEnabled = true;
@@ -238,6 +254,16 @@ namespace PerfGuard
   "GameThread": {
     "Priority": 0,
     "AffinityMask": 0
+  },
+  "ExperimentalThreading": {
+    "Enabled": false,
+    "DinoActorTick": true,
+    "DinoAIControllerTick": true,
+    "DinoMovement": false,
+    "DinoMesh": false,
+    "IncludeTamed": false,
+    "OnlyBeyondDistance": 0,
+    "ScanIntervalSeconds": 10
   }
 }
 )JSON");
@@ -331,6 +357,18 @@ namespace PerfGuard
 			Read(j, "Priority", c.threadPriority);
 			Read(j, "AffinityMask", c.threadAffinityMask);
 		}
+		if (root.contains("ExperimentalThreading"))
+		{
+			const auto& j = root["ExperimentalThreading"];
+			Read(j, "Enabled", c.mtEnabled);
+			Read(j, "DinoActorTick", c.mtDinoActorTick);
+			Read(j, "DinoAIControllerTick", c.mtDinoController);
+			Read(j, "DinoMovement", c.mtDinoMovement);
+			Read(j, "DinoMesh", c.mtDinoMesh);
+			Read(j, "IncludeTamed", c.mtIncludeTamed);
+			Read(j, "OnlyBeyondDistance", c.mtOnlyBeyondDistance);
+			Read(j, "ScanIntervalSeconds", c.mtScanSeconds);
+		}
 		if (root.contains("LogFilter"))
 		{
 			const auto& j = root["LogFilter"];
@@ -377,6 +415,7 @@ namespace PerfGuard
 		c.maintMinMinutesBetweenGC = (std::max)(1, c.maintMinMinutesBetweenGC);
 		c.windowEmptyForMinutes = (std::max)(1, c.windowEmptyForMinutes);
 		c.threadPriority = std::clamp(c.threadPriority, 0, 3);
+		c.mtScanSeconds = std::clamp(c.mtScanSeconds, 2, 300);
 
 		g_cfg = c;
 	}
@@ -1037,11 +1076,18 @@ namespace PerfGuard
 	const char* kBucketNames[B_Count] = {"world tick", "dino tick", "dino AI", "movement", "pathfinding", "animation",
 		"status (inside dino/player tick)", "player tick", "game mode"};
 
+	// atomics: with experimental threading some hooked ticks can run on worker threads
 	struct BucketStats
 	{
-		int64 ticks = 0;     // QPC ticks in the current report window
-		int64 calls = 0;
-		int64 frameTicks = 0; // QPC ticks in the current frame (for hitch breakdown)
+		std::atomic<int64> ticks{0};      // QPC ticks in the current report window
+		std::atomic<int64> calls{0};
+		std::atomic<int64> frameTicks{0}; // QPC ticks in the current frame (for hitch breakdown)
+		void Reset()
+		{
+			ticks.store(0, std::memory_order_relaxed);
+			calls.store(0, std::memory_order_relaxed);
+			frameTicks.store(0, std::memory_order_relaxed);
+		}
 	};
 	BucketStats g_prof[B_Count];
 	int64 g_profFrames = 0;
@@ -1074,9 +1120,9 @@ namespace PerfGuard
 			if (!on)
 				return;
 			const int64 d = Qpc() - start;
-			g_prof[b].ticks += d;
-			g_prof[b].frameTicks += d;
-			g_prof[b].calls++;
+			g_prof[b].ticks.fetch_add(d, std::memory_order_relaxed);
+			g_prof[b].frameTicks.fetch_add(d, std::memory_order_relaxed);
+			g_prof[b].calls.fetch_add(1, std::memory_order_relaxed);
 		}
 	};
 
@@ -1090,19 +1136,19 @@ namespace PerfGuard
 		if (g_profFrames == 0)
 			return "Profiler: no frames yet";
 		const double frames = static_cast<double>(g_profFrames);
-		const double worldMs = TicksToMs(g_prof[B_World].ticks) / frames;
+		const double worldMs = TicksToMs(g_prof[B_World].ticks.load()) / frames;
 		s << "Profile, ms per frame over " << g_profFrames << " frames: world tick " << worldMs;
 		for (int i = B_DinoTick; i < B_Count; ++i)
 		{
-			const double ms = TicksToMs(g_prof[i].ticks) / frames;
+			const double ms = TicksToMs(g_prof[i].ticks.load()) / frames;
 			s << " | " << kBucketNames[i] << " " << ms;
 			if (worldMs > 0.0)
-				s << " (" << static_cast<int>(ms * 100.0 / worldMs) << "%, " << (g_prof[i].calls / g_profFrames) << " calls)";
+				s << " (" << static_cast<int>(ms * 100.0 / worldMs) << "%, " << (g_prof[i].calls.load() / g_profFrames) << " calls)";
 		}
 		if (reset)
 		{
 			for (auto& b : g_prof)
-				b = BucketStats{};
+				b.Reset();
 			g_profFrames = 0;
 		}
 		return s.str();
@@ -1121,13 +1167,16 @@ namespace PerfGuard
 	std::unordered_map<const void*, ThrottleState> g_throttle; // keyed by dino AND its AI controller
 	int g_throttleTier1 = 0;
 	int g_throttleTier2 = 0;
-	int64 g_throttleSkipped = 0;
+	std::atomic<int64> g_throttleSkipped{0};
+	std::shared_mutex g_throttleMutex;       // guards g_throttle against worker-thread ticks during a rebuild
+	std::atomic<size_t> g_throttleSize{0};
 
 	// returns false when this call should be skipped; otherwise dt holds the accumulated delta to pass on
 	inline bool ThrottleAllows(const void* key, Slot slot, float& dt)
 	{
-		if (!g_cfg.throttleEnabled || g_throttle.empty() || key == nullptr)
+		if (!g_cfg.throttleEnabled || g_throttleSize.load(std::memory_order_relaxed) == 0 || key == nullptr)
 			return true;
+		std::shared_lock lock(g_throttleMutex);
 		const auto it = g_throttle.find(key);
 		if (it == g_throttle.end())
 			return true;
@@ -1135,7 +1184,7 @@ namespace PerfGuard
 		st.acc[slot] += dt;
 		if (++st.frame[slot] < st.every)
 		{
-			++g_throttleSkipped;
+			g_throttleSkipped.fetch_add(1, std::memory_order_relaxed);
 			return false;
 		}
 		st.frame[slot] = 0;
@@ -1148,7 +1197,9 @@ namespace PerfGuard
 	{
 		if (!g_cfg.throttleEnabled)
 		{
+			std::unique_lock lock(g_throttleMutex);
 			g_throttle.clear();
+			g_throttleSize = 0;
 			g_throttleTier1 = g_throttleTier2 = 0;
 			return;
 		}
@@ -1197,7 +1248,11 @@ namespace PerfGuard
 			if (AController* ctrl = dino->ControllerField().Get())
 				keep(ctrl);
 		}
-		g_throttle.swap(next);
+		{
+			std::unique_lock lock(g_throttleMutex);
+			g_throttle.swap(next);
+			g_throttleSize = g_throttle.size();
+		}
 		g_throttleTier1 = t1;
 		g_throttleTier2 = t2;
 	}
@@ -1208,7 +1263,7 @@ namespace PerfGuard
 		if (!g_cfg.throttleEnabled)
 			return "Distance throttle off";
 		s << "Distance throttle: " << g_throttleTier1 << " wild dinos at 1/" << g_cfg.tier1EveryNFrames << " rate, "
-		  << g_throttleTier2 << " at 1/" << g_cfg.tier2EveryNFrames << " rate, " << g_throttleSkipped
+		  << g_throttleTier2 << " at 1/" << g_cfg.tier2EveryNFrames << " rate, " << g_throttleSkipped.load()
 		  << " ticks skipped since last report";
 		return s.str();
 	}
@@ -1233,12 +1288,12 @@ namespace PerfGuard
 			return;
 		}
 		for (auto& b : g_prof)
-			b.frameTicks = 0;
+			b.frameTicks.store(0, std::memory_order_relaxed);
 		const int64 start = Qpc();
 		UWorld_Tick_original(world, tickType, dt);
 		const int64 d = Qpc() - start;
-		g_prof[B_World].ticks += d;
-		g_prof[B_World].calls++;
+		g_prof[B_World].ticks.fetch_add(d, std::memory_order_relaxed);
+		g_prof[B_World].calls.fetch_add(1, std::memory_order_relaxed);
 		++g_profFrames;
 		g_lastWorldTickMs = TicksToMs(d);
 
@@ -1251,7 +1306,7 @@ namespace PerfGuard
 			s.precision(0);
 			s << "Hitch inside world tick: " << g_lastWorldTickMs << " ms. Breakdown:";
 			for (int i = B_DinoTick; i < B_Count; ++i)
-				s << " " << kBucketNames[i] << " " << TicksToMs(g_prof[i].frameTicks) << ",";
+				s << " " << kBucketNames[i] << " " << TicksToMs(g_prof[i].frameTicks.load()) << ",";
 			s << " other (Blueprints, structures, network, mods) is the remainder";
 			Log::GetLog()->warn("{}", s.str());
 		}
@@ -1386,6 +1441,223 @@ namespace PerfGuard
 				AsaApi::GetHooks().DisableHook(h.name, h.detour);
 		}
 		g_tickHooksInstalled = g_printHookInstalled = false;
+	}
+
+	// ------------------------------------------------------------------------------------------------ experimental threading
+	//
+	// Unreal decides per tick function, every frame, whether it runs on the game thread or on a worker thread
+	// (FTickFunction::bRunOnAnyThread). ARK leaves it off for its own ticks. AsaApi's headers don't expose that
+	// bit, but AsaApi's offsets cache (built from the game's PDB) records the exact bit position, so we read it
+	// from there instead of guessing. Flipping it makes the chosen ticks run in parallel with the game thread.
+	// ARK's code was never written for that, so expect crashes: this is a measured experiment, off by default.
+
+	struct BitInfo
+	{
+		uint64 offset = 0;
+		uint32 bit = 0;
+		bool found = false;
+	};
+	BitInfo g_bitAnyThread;
+	BitInfo g_bitCanEverTick;
+	std::string g_layoutStatus = "not loaded";
+
+	bool ReadBitfieldCache(const std::filesystem::path& file, std::map<std::string, BitInfo>& wanted)
+	{
+		std::ifstream in(file, std::ios::binary);
+		if (!in.good())
+			return false;
+		struct RawBitField
+		{
+			uint64 offset;
+			uint32 bit_position;
+			uint64 num_bits;
+			uint64 length;
+		};
+		static_assert(sizeof(RawBitField) == 32, "BitField layout must match AsaApi's cache format");
+		size_t remaining = wanted.size();
+		while (remaining > 0)
+		{
+			size_t keySize = 0;
+			if (!in.read(reinterpret_cast<char*>(&keySize), sizeof(keySize)) || keySize == 0 || keySize > 4096)
+				break;
+			std::string key(keySize, '\0');
+			RawBitField raw{};
+			if (!in.read(key.data(), static_cast<std::streamsize>(keySize)) ||
+				!in.read(reinterpret_cast<char*>(&raw), sizeof(raw)))
+				break;
+			auto it = wanted.find(key);
+			if (it != wanted.end() && !it->second.found && raw.num_bits == 1 && raw.bit_position < 64 && raw.offset < 0x400)
+			{
+				it->second = BitInfo{raw.offset, raw.bit_position, true};
+				--remaining;
+			}
+		}
+		return remaining == 0;
+	}
+
+	void LoadTickLayout()
+	{
+		namespace fs = std::filesystem;
+		const fs::path root = fs::path(AsaApi::Tools::GetCurrentDir()) / "ArkApi" / "Cache";
+		std::error_code ec;
+		std::vector<fs::path> files;
+		for (fs::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec))
+			if (it->is_regular_file(ec) && it->path().filename() == "cached_bitfields.cache")
+				files.push_back(it->path());
+		std::sort(files.begin(), files.end(), [](const fs::path& a, const fs::path& b) {
+			std::error_code e1, e2;
+			return fs::last_write_time(a, e1) > fs::last_write_time(b, e2); // newest first
+		});
+
+		for (const auto& f : files)
+		{
+			std::map<std::string, BitInfo> wanted{{"FTickFunction.bRunOnAnyThread", {}}, {"FTickFunction.bCanEverTick", {}}};
+			if (ReadBitfieldCache(f, wanted))
+			{
+				g_bitAnyThread = wanted["FTickFunction.bRunOnAnyThread"];
+				g_bitCanEverTick = wanted["FTickFunction.bCanEverTick"];
+				std::ostringstream s;
+				s << "tick layout from " << f.string() << ": bRunOnAnyThread at +" << g_bitAnyThread.offset << " bit "
+				  << g_bitAnyThread.bit << ", bCanEverTick at +" << g_bitCanEverTick.offset << " bit " << g_bitCanEverTick.bit;
+				g_layoutStatus = s.str();
+				Log::GetLog()->info("Experimental threading: {}", g_layoutStatus);
+				return;
+			}
+		}
+		g_layoutStatus = files.empty() ? "no AsaApi bitfield cache found under ArkApi/Cache"
+			: "FTickFunction bits not present in AsaApi's cache";
+		Log::GetLog()->warn("Experimental threading unavailable: {}", g_layoutStatus);
+	}
+
+	inline uint8* BitByte(void* tickFn, const BitInfo& b)
+	{
+		return reinterpret_cast<uint8*>(tickFn) + b.offset + b.bit / 8;
+	}
+	inline bool GetBit(void* tickFn, const BitInfo& b) { return (*BitByte(tickFn, b) >> (b.bit % 8)) & 1; }
+	inline void SetBit(void* tickFn, const BitInfo& b, bool v)
+	{
+		uint8* p = BitByte(tickFn, b);
+		const uint8 m = static_cast<uint8>(1u << (b.bit % 8));
+		*p = v ? static_cast<uint8>(*p | m) : static_cast<uint8>(*p & ~m);
+	}
+
+	std::unordered_map<void*, bool> g_anyThreadFlipped; // tick function -> original bit value
+	int g_anyThreadCount = 0;
+	bool g_anyThreadAborted = false;
+
+	// collects the tick functions of one dino that the config selects
+	void SelectedTickFunctions(APrimalDinoCharacter* dino, std::vector<void*>& out)
+	{
+		if (g_cfg.mtDinoActorTick)
+			out.push_back(&dino->PrimaryActorTickField());
+		if (g_cfg.mtDinoController)
+			if (AController* ctrl = dino->ControllerField().Get())
+				out.push_back(&ctrl->PrimaryActorTickField());
+		if (g_cfg.mtDinoMovement)
+			if (UCharacterMovementComponent* mv = dino->CharacterMovementField().Get())
+				out.push_back(&mv->PrimaryComponentTickField());
+		if (g_cfg.mtDinoMesh)
+			if (USkeletalMeshComponent* mesh = dino->MeshField().Get())
+				out.push_back(&mesh->PrimaryComponentTickField());
+	}
+
+	void RestoreAnyThread(const std::unordered_set<void*>* alive)
+	{
+		for (const auto& [fn, original] : g_anyThreadFlipped)
+			if (alive == nullptr || alive->count(fn)) // never touch memory of actors that no longer exist
+				SetBit(fn, g_bitAnyThread, original);
+		g_anyThreadFlipped.clear();
+		g_anyThreadCount = 0;
+	}
+
+	void UpdateAnyThread()
+	{
+		const bool want = g_cfg.mtEnabled && g_bitAnyThread.found && !g_anyThreadAborted;
+		UWorld* world = World();
+		if (world == nullptr)
+			return;
+		if (!want && g_anyThreadFlipped.empty())
+			return;
+
+		const std::vector<FVector> players = LivingPlayerPositions(world);
+		std::unordered_set<void*> alive;   // every selectable tick function that exists right now
+		std::unordered_set<void*> desired; // the ones that should run on worker threads
+		std::vector<void*> fns;
+
+		for (AActor* a : AllActorsOf<APrimalDinoCharacter>(world))
+		{
+			if (!IsUsable(a))
+				continue;
+			auto* dino = static_cast<APrimalDinoCharacter*>(a);
+			fns.clear();
+			SelectedTickFunctions(dino, fns);
+			for (void* fn : fns)
+				alive.insert(fn);
+
+			if (!want || dino->IsDead() || dino->bIsBossDino()())
+				continue;
+			const bool wild = dino->TargetingTeamField() < kTamedTeamMin;
+			if (!wild && !g_cfg.mtIncludeTamed)
+				continue;
+			if (g_cfg.mtOnlyBeyondDistance > 0.0 &&
+				NearestPlayerDistance(dino->GetLocation(), players) < g_cfg.mtOnlyBeyondDistance)
+				continue;
+			for (void* fn : fns)
+				desired.insert(fn);
+		}
+
+		// sanity check: every selected tick function must report bCanEverTick, otherwise the layout is wrong
+		if (want && g_bitCanEverTick.found)
+		{
+			int checked = 0, ok = 0;
+			for (void* fn : desired)
+			{
+				if (++checked > 64)
+					break;
+				ok += GetBit(fn, g_bitCanEverTick) ? 1 : 0;
+			}
+			if (checked > 8 && ok * 2 < (std::min)(checked, 64))
+			{
+				g_anyThreadAborted = true;
+				Log::GetLog()->error("Experimental threading aborted: only {}/{} tick functions look valid, layout mismatch",
+					ok, (std::min)(checked, 64));
+				RestoreAnyThread(&alive);
+				return;
+			}
+		}
+
+		// restore the ones that left the selection (player came close, dino tamed, feature switched off)
+		for (auto it = g_anyThreadFlipped.begin(); it != g_anyThreadFlipped.end();)
+		{
+			if (!alive.count(it->first))
+				it = g_anyThreadFlipped.erase(it); // actor gone: forget it, don't touch freed memory
+			else if (!desired.count(it->first))
+			{
+				SetBit(it->first, g_bitAnyThread, it->second);
+				it = g_anyThreadFlipped.erase(it);
+			}
+			else
+				++it;
+		}
+		// flip the new ones
+		for (void* fn : desired)
+		{
+			if (g_anyThreadFlipped.count(fn))
+				continue;
+			g_anyThreadFlipped[fn] = GetBit(fn, g_bitAnyThread);
+			SetBit(fn, g_bitAnyThread, true);
+		}
+		g_anyThreadCount = static_cast<int>(g_anyThreadFlipped.size());
+	}
+
+	std::string ThreadingSummary()
+	{
+		std::ostringstream s;
+		s << "Experimental threading " << (g_cfg.mtEnabled ? "on" : "off");
+		if (g_anyThreadAborted)
+			s << " (ABORTED: layout check failed)";
+		s << ", " << g_anyThreadCount << " tick functions on worker threads; " << g_layoutStatus;
+		return s.str();
 	}
 
 	// ------------------------------------------------------------------------------------------------ idle mode, maintenance, game thread
@@ -1573,10 +1845,12 @@ namespace PerfGuard
 				Log::GetLog()->info("{}", g_lastReport);
 				if (g_tickHooksInstalled && g_cfg.profilerEnabled)
 					Log::GetLog()->info("{}", ProfileSummary(true));
+				if (g_cfg.mtEnabled)
+					Log::GetLog()->info("{}", ThreadingSummary());
 				if (g_cfg.throttleEnabled)
 				{
 					Log::GetLog()->info("{}", ThrottleSummary());
-					g_throttleSkipped = 0;
+					g_throttleSkipped.store(0);
 				}
 				if (g_printBlocked > 0)
 				{
@@ -1593,6 +1867,8 @@ namespace PerfGuard
 			if (g_seconds % g_cfg.throttleScanSeconds == 0)
 				RebuildThrottle();
 			UpdatePresence();
+			if (g_seconds % g_cfg.mtScanSeconds == 0)
+				UpdateAnyThread();
 			CheckRestartWindow();
 			CheckSchedule();
 		}
@@ -1689,6 +1965,8 @@ namespace PerfGuard
 	void RconReload(RCONClientConnection* conn, RCONPacket* packet, UWorld*)
 	{
 		const std::string msg = LoadConfig();
+		g_anyThreadAborted = false;
+		UpdateAnyThread(); // applies or restores immediately
 		const int n = ApplyCVars();
 		Reply(conn, packet, msg + ". Re-applied " + std::to_string(n) + " console variable(s).");
 	}
@@ -1696,7 +1974,7 @@ namespace PerfGuard
 	void RconProfile(RCONClientConnection* conn, RCONPacket* packet, UWorld*)
 	{
 		std::ostringstream s;
-		s << ProfileSummary(false) << "\n" << ThrottleSummary() << "\nPlayers online " << g_playersOnline << ", idle mode "
+		s << ProfileSummary(false) << "\n" << ThrottleSummary() << "\n" << ThreadingSummary() << "\nPlayers online " << g_playersOnline << ", idle mode "
 		  << (g_idleActive ? "on" : "off") << ", PrintString blocked " << g_printBlocked;
 		Reply(conn, packet, s.str());
 	}
@@ -1723,6 +2001,7 @@ extern "C" __declspec(dllexport) void Plugin_Init()
 	Log::Get().Init(PROJECT_NAME);
 	Log::GetLog()->info("{}", LoadConfig());
 	InstallHooks();
+	LoadTickLayout();
 
 	AsaApi::GetCommands().AddOnTickCallback(FString("PerfGuard.Tick"), &OnTick);
 	AsaApi::GetCommands().AddOnTimerCallback(FString("PerfGuard.Timer"), &OnSecond);
@@ -1736,6 +2015,12 @@ extern "C" __declspec(dllexport) void Plugin_Init()
 extern "C" __declspec(dllexport) void Plugin_Unload()
 {
 	using namespace PerfGuard;
+	{
+		const bool keep = g_cfg.mtEnabled;
+		g_cfg.mtEnabled = false;
+		UpdateAnyThread(); // puts every flipped tick function back on the game thread
+		g_cfg.mtEnabled = keep;
+	}
 	RemoveHooks();
 	AsaApi::GetCommands().RemoveOnTickCallback(FString("PerfGuard.Tick"));
 	AsaApi::GetCommands().RemoveOnTimerCallback(FString("PerfGuard.Timer"));

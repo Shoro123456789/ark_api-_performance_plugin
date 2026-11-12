@@ -43,6 +43,27 @@ An [AsaApi](https://github.com/ArkServerApi/AsaApi) plugin for ARK: Survival Asc
 2. Change one thing, either in `config.json` or with `perf.exec`.
 3. Compare the next day's `Tick:` lines at a similar player count. **avg ms** is general load. **p99 / worst** are the hitches players feel.
 
+## Experimental threading
+
+Unreal can run a tick on a worker thread instead of the game thread when that tick's `bRunOnAnyThread` flag is set. ARK leaves it off for its own code. PerfGuard reads the flag's exact location from AsaApi's offsets cache, which AsaApi builds from the game's debug symbols, so it doesn't guess. It then sets the flag on the wild-dino ticks you choose:
+
+| Setting | Ticks moved to worker threads |
+|---|---|
+| `DinoActorTick` | The dino's own `Tick` (stats, timers, Blueprint tick) |
+| `DinoAIControllerTick` | The dino's AI controller |
+| `DinoMovement` | Character movement (most likely to crash: touches physics and collision) |
+| `DinoMesh` | Skeletal mesh / animation |
+| `IncludeTamed` | Also tamed dinos (off: crashes would hit your own dinos) |
+| `OnlyBeyondDistance` | Only dinos at least this far from every player (Unreal units, 10000 = 100 m) |
+
+**Safety checks:**
+- It checks every selected tick function reports `bCanEverTick`. If the layout looks wrong, it aborts and puts everything back.
+- It only touches dinos it found in the current scan, never freed memory.
+- Switching it off, `perf.reload` or unloading the plugin moves every tick back to the game thread.
+- `perf.profile` shows how many ticks are on worker threads.
+
+**Expect crashes.** ARK's code assumes one thread. Ticks running at the same time as the game thread can corrupt data or crash, and a crash may only appear after minutes or hours. Test it on a throwaway save. The zip includes `config.threading.json`, which is the performance preset plus threading for the actor and AI ticks of wild dinos beyond 100 m. Rename it to `config.json` to try it.
+
 ## Config notes
 
 - **Log filter removed:** v2.0 hooked Blueprint `PrintString` to drop "CS Cast Failed" spam, but that function's layout differs on ARK 97.21 and it crashed the server. To hide the spam, filter the console in the startup command instead: `tail ... | grep --line-buffered -v "CS Cast Failed"`.

@@ -1,0 +1,169 @@
+{
+  "Monitor": {
+    "Enabled": true,
+    "ReportIntervalSeconds": 300,
+    "CountActorsInReport": true,
+    "HitchLogMs": 500
+  },
+  "WildDinoCap": {
+    "Enabled": true,
+    "DryRun": false,
+    "MaxWildDinos": 0,
+    "AutoBaselineStartMinutes": 10,
+    "AutoBaselineEndMinutes": 30,
+    "AutoHeadroomPercent": 15,
+    "PerSpeciesMax": 0,
+    "CheckIntervalSeconds": 600,
+    "MinDistanceFromPlayers": 20000,
+    "MaxRemovalsPerPass": 150,
+    "ExcludeSpecies": []
+  },
+  "Cleanup": {
+    "Enabled": true,
+    "DryRun": false,
+    "IntervalSeconds": 300,
+    "CorpseMaxAgeMinutes": 15,
+    "DroppedItemMaxAgeMinutes": 45,
+    "IncludePlayerDroppedItems": false,
+    "MinDistanceFromPlayers": 15000,
+    "MaxPerPass": 200
+  },
+  "ScheduledRestart": {
+    "Enabled": true,
+    "Times": [],
+    "WarningMinutes": [
+      30,
+      15,
+      10,
+      5,
+      1
+    ],
+    "SaveToExitDelaySeconds": 30,
+    "WindowEnabled": true,
+    "WindowStart": "03:00",
+    "WindowEnd": "07:00",
+    "WindowEmptyForMinutes": 5
+  },
+  "CVars": {
+    "Enabled": true,
+    "ReapplyMinutes": 30,
+    "List": [
+      {
+        "Command": "a.URO.Enable 1",
+        "Enabled": true,
+        "Note": "Animation update-rate optimisation"
+      },
+      {
+        "Command": "a.ParallelAnimUpdate 1",
+        "Enabled": true,
+        "Note": "Animation update on worker threads"
+      },
+      {
+        "Command": "a.ParallelAnimEvaluation 1",
+        "Enabled": true,
+        "Note": "Animation evaluation on worker threads"
+      },
+      {
+        "Command": "a.ParallelAnimInterpolation 1",
+        "Enabled": true,
+        "Note": "Animation interpolation on worker threads"
+      },
+      {
+        "Command": "a.URO.ForceAnimRate 4",
+        "Enabled": true,
+        "Note": "AGGRESSIVE: server animates every 4th frame. Disable first if hits on moving dinos feel off"
+      },
+      {
+        "Command": "net.UseAdaptiveNetUpdateFrequency 1",
+        "Enabled": true,
+        "Note": "Replicate idle actors less often"
+      },
+      {
+        "Command": "tick.AllowAsyncTickDispatch 1",
+        "Enabled": true,
+        "Note": "Dispatch tick tasks from worker threads"
+      },
+      {
+        "Command": "tick.AllowAsyncTickCleanup 1",
+        "Enabled": true,
+        "Note": "Clean up tick tasks on worker threads"
+      },
+      {
+        "Command": "tick.AllowConcurrentTickQueue 1",
+        "Enabled": true,
+        "Note": "Queue ticks concurrently"
+      },
+      {
+        "Command": "gc.AllowIncrementalReachability 1",
+        "Enabled": true,
+        "Note": "Spread GC marking over frames (turn PerformaceGC AutoGC/GCCVars off)"
+      },
+      {
+        "Command": "gc.IncrementalReachabilityTimeLimit 0.005",
+        "Enabled": true,
+        "Note": "5 ms GC budget per frame"
+      },
+      {
+        "Command": "gc.AllowIncrementalGather 1",
+        "Enabled": true,
+        "Note": "Spread GC gather over frames"
+      },
+      {
+        "Command": "gc.MultithreadedDestructionEnabled 1",
+        "Enabled": true,
+        "Note": "Destroy objects on worker threads"
+      },
+      {
+        "Command": "s.ForceGCAfterLevelStreamedOut 0",
+        "Enabled": true,
+        "Note": "No forced GC each time an area unloads (uses more RAM)"
+      },
+      {
+        "Command": "s.ContinuouslyIncrementalGCWhileLevelsPendingPurge 0",
+        "Enabled": true,
+        "Note": "No extra GC passes while areas unload"
+      }
+    ]
+  },
+  "Profiler": {
+    "Enabled": true
+  },
+  "DistanceThrottle": {
+    "Enabled": true,
+    "Tier1Distance": 10000,
+    "Tier1EveryNFrames": 3,
+    "Tier2Distance": 25000,
+    "Tier2EveryNFrames": 15,
+    "ScanIntervalSeconds": 3,
+    "MaxAccumulatedSeconds": 1.0,
+    "ThrottleActorTick": true,
+    "ThrottleAI": true,
+    "ThrottleMovement": true,
+    "ThrottleAnimation": true
+  },
+  "IdleMode": {
+    "Enabled": true,
+    "EmptyForSeconds": 120,
+    "IdleMaxFPS": 5,
+    "ActiveMaxFPS": 30
+  },
+  "EmptyServerMaintenance": {
+    "Enabled": true,
+    "EmptyForMinutes": 5,
+    "MinMinutesBetweenGC": 15
+  },
+  "GameThread": {
+    "Priority": 2,
+    "AffinityMask": 0
+  },
+  "ExperimentalThreading": {
+    "Enabled": true,
+    "DinoActorTick": true,
+    "DinoAIControllerTick": true,
+    "DinoMovement": false,
+    "DinoMesh": false,
+    "IncludeTamed": false,
+    "OnlyBeyondDistance": 10000,
+    "ScanIntervalSeconds": 10
+  }
+}

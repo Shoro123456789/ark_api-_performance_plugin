@@ -103,6 +103,7 @@ jobs:
           Copy-Item configs/PluginInfo.json $pkg
           Copy-Item configs/config.json $pkg
           Copy-Item configs/config.performance.json $pkg
+          Copy-Item configs/config.threading.json $pkg
           Copy-Item README.md package/
           if (Test-Path out/PerfGuard.map) { Copy-Item out/PerfGuard.map package/ }
           Compress-Archive -Path package/* -DestinationPath PerfGuard.zip -Force

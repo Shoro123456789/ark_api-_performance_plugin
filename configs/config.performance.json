@@ -155,5 +155,15 @@
   "GameThread": {
     "Priority": 2,
     "AffinityMask": 0
+  },
+  "ExperimentalThreading": {
+    "Enabled": false,
+    "DinoActorTick": true,
+    "DinoAIControllerTick": true,
+    "DinoMovement": false,
+    "DinoMesh": false,
+    "IncludeTamed": false,
+    "OnlyBeyondDistance": 0,
+    "ScanIntervalSeconds": 10
   }
 }
