@@ -90,6 +90,9 @@ jobs:
             Write-Host "=== RVA $rva"
             & $sym --obj=out/PerfGuard.dll --relative-address --inlines --pretty-print $rva.Trim()
           }
+          Write-Host "=== MAP BEGIN"
+          Get-Content out/PerfGuard.map | Where-Object { $_ -match '^\s+0001:' } | ForEach-Object { Write-Host "MAP $_" }
+          Write-Host "=== MAP END"
 
       - name: Package
         shell: pwsh
@@ -101,6 +104,7 @@ jobs:
           Copy-Item configs/config.json $pkg
           Copy-Item configs/config.performance.json $pkg
           Copy-Item README.md package/
+          if (Test-Path out/PerfGuard.map) { Copy-Item out/PerfGuard.map package/ }
           Compress-Archive -Path package/* -DestinationPath PerfGuard.zip -Force
 
       - uses: actions/upload-artifact@v4
