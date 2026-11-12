@@ -1105,12 +1105,18 @@ namespace PerfGuard
 
 	inline double TicksToMs(int64 t) { return static_cast<double>(t) * 1000.0 / static_cast<double>(g_qpcFreq); }
 
+	// Sampling profiler: reading the clock is slow under Wine/FEX, so only 1 in kSampleEvery calls is timed and
+	// the result is scaled up. Unsampled calls cost one thread-local increment.
+	constexpr uint32 kSampleEvery = 32;
+	thread_local uint32 t_sampleCounter = 0;
+
 	struct ScopedBucket
 	{
 		Bucket b;
 		int64 start;
 		bool on;
-		explicit ScopedBucket(Bucket bucket) : b(bucket), start(0), on(g_cfg.profilerEnabled)
+		explicit ScopedBucket(Bucket bucket)
+			: b(bucket), start(0), on(g_cfg.profilerEnabled && (++t_sampleCounter % kSampleEvery) == 0)
 		{
 			if (on)
 				start = Qpc();
@@ -1119,10 +1125,10 @@ namespace PerfGuard
 		{
 			if (!on)
 				return;
-			const int64 d = Qpc() - start;
+			const int64 d = (Qpc() - start) * static_cast<int64>(kSampleEvery);
 			g_prof[b].ticks.fetch_add(d, std::memory_order_relaxed);
 			g_prof[b].frameTicks.fetch_add(d, std::memory_order_relaxed);
-			g_prof[b].calls.fetch_add(1, std::memory_order_relaxed);
+			g_prof[b].calls.fetch_add(kSampleEvery, std::memory_order_relaxed);
 		}
 	};
 
@@ -1137,7 +1143,7 @@ namespace PerfGuard
 			return "Profiler: no frames yet";
 		const double frames = static_cast<double>(g_profFrames);
 		const double worldMs = TicksToMs(g_prof[B_World].ticks.load()) / frames;
-		s << "Profile, ms per frame over " << g_profFrames << " frames: world tick " << worldMs;
+		s << "Profile (sampled 1 in " << kSampleEvery << " calls), ms per frame over " << g_profFrames << " frames: world tick " << worldMs;
 		for (int i = B_DinoTick; i < B_Count; ++i)
 		{
 			const double ms = TicksToMs(g_prof[i].ticks.load()) / frames;
@@ -1170,13 +1176,18 @@ namespace PerfGuard
 	std::atomic<int64> g_throttleSkipped{0};
 	std::shared_mutex g_throttleMutex;       // guards g_throttle against worker-thread ticks during a rebuild
 	std::atomic<size_t> g_throttleSize{0};
+	std::atomic<bool> g_parallelTicks{false}; // true only while experimental threading has ticks on worker threads
 
 	// returns false when this call should be skipped; otherwise dt holds the accumulated delta to pass on
 	inline bool ThrottleAllows(const void* key, Slot slot, float& dt)
 	{
 		if (!g_cfg.throttleEnabled || g_throttleSize.load(std::memory_order_relaxed) == 0 || key == nullptr)
 			return true;
-		std::shared_lock lock(g_throttleMutex);
+		// all hooked ticks run on the game thread unless experimental threading is active, so skip the lock then
+		std::shared_lock<std::shared_mutex> lock(g_throttleMutex, std::defer_lock);
+		const bool parallel = g_parallelTicks.load(std::memory_order_relaxed);
+		if (parallel)
+			lock.lock();
 		const auto it = g_throttle.find(key);
 		if (it == g_throttle.end())
 			return true;
@@ -1184,7 +1195,10 @@ namespace PerfGuard
 		st.acc[slot] += dt;
 		if (++st.frame[slot] < st.every)
 		{
-			g_throttleSkipped.fetch_add(1, std::memory_order_relaxed);
+			if (parallel)
+				g_throttleSkipped.fetch_add(1, std::memory_order_relaxed);
+			else
+				g_throttleSkipped.store(g_throttleSkipped.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 			return false;
 		}
 		st.frame[slot] = 0;
@@ -1568,6 +1582,7 @@ namespace PerfGuard
 				SetBit(fn, g_bitAnyThread, original);
 		g_anyThreadFlipped.clear();
 		g_anyThreadCount = 0;
+		g_parallelTicks = false;
 	}
 
 	void UpdateAnyThread()
@@ -1648,6 +1663,7 @@ namespace PerfGuard
 			SetBit(fn, g_bitAnyThread, true);
 		}
 		g_anyThreadCount = static_cast<int>(g_anyThreadFlipped.size());
+		g_parallelTicks = g_anyThreadCount > 0;
 	}
 
 	std::string ThreadingSummary()
