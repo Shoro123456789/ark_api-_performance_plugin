@@ -64,6 +64,12 @@ Unreal can run a tick on a worker thread instead of the game thread when that ti
 
 **Expect crashes.** ARK's code assumes one thread. Ticks running at the same time as the game thread can corrupt data or crash, and a crash may only appear after minutes or hours. Test it on a throwaway save. The zip includes `config.threading.json`, which is the performance preset plus threading for the actor and AI ticks of wild dinos beyond 100 m. Rename it to `config.json` to try it.
 
+## What the 70,000-dino log showed (v2.4)
+
+- **Stasis:** ARK already puts dinos far from players into stasis or hibernation. Only a handful of dino updates run per frame, so distance throttle and experimental threading have little to act on. Both are off in every preset now. They're still available for testing.
+- **Scan cost:** in 2.3 and earlier, each scan of every dino cost most of a second under FEX, because of per-field name lookups. 2.4 resolves field locations once, checks them against AsaApi's accessors, then reads memory directly. Any scan over 50 ms is logged with its time.
+- **Profiler:** it now also times wild spawn zones (`UpdateZone`, `CheckIncreaseNPC`, `SpawnNPCs`) and hibernation wake-up (`AwakenActorsForPlayers`). Those are where a huge wild population costs time while players move around.
+
 ## Config notes
 
 - **Log filter removed:** v2.0 hooked Blueprint `PrintString` to drop "CS Cast Failed" spam, but that function's layout differs on ARK 97.21 and it crashed the server. To hide the spam, filter the console in the startup command instead: `tail ... | grep --line-buffered -v "CS Cast Failed"`.

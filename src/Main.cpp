@@ -16,6 +16,9 @@
 //  12. Game thread        - optional priority and CPU pinning for the main game thread.
 //  13. Experimental threading - runs chosen wild-dino ticks on worker threads (bRunOnAnyThread). Expect crashes.
 //
+// Scans read dino fields through offsets resolved once and verified against AsaApi's accessors ("fast dino access"),
+// because per-field name lookups made each 70,000-dino scan freeze the server for most of a second under FEX.
+//
 // Everything runs on the game thread (AsaApi tick/timer/RCON callbacks), so no locking is needed.
 
 #include <API/ARK/Ark.h>
@@ -505,13 +508,236 @@ namespace PerfGuard
 		return actors;
 	}
 
-	bool IsUsable(AActor* a) { return a != nullptr && !a->IsPendingKillPending(); }
+	struct DinoLayout;
+	extern bool g_fastActors; // set once fast dino access is verified
+	bool g_fastActors = false;
+	bool IsUsable(AActor* a) { return a != nullptr && (g_fastActors || !a->IsPendingKillPending()); }
 
 	void Broadcast(const std::wstring& msg)
 	{
 		AsaApi::GetApiUtils().SendNotificationToAll(FColorList::Yellow, 1.3f, 12.0f, nullptr, msg.c_str());
 		AsaApi::GetApiUtils().SendChatMessageToAll(FString("Server"), msg.c_str());
 	}
+
+	// ------------------------------------------------------------------------------------------------ fast field access
+	//
+	// Every AsaApi field accessor looks the field up by name in a hash map, and every NativeCall does the same for the
+	// function. With ~70,000 dinos and FEX emulation that made one scan take most of a second. Field offsets never change
+	// while the server runs, so PerfGuard resolves them once and then reads memory directly. Bit positions come from
+	// AsaApi's offsets cache (built from the game's debug symbols). The fast path is verified against the slow accessors
+	// on real dinos first; any mismatch keeps the slow path.
+
+	struct BitInfo
+	{
+		uint64 offset = 0;
+		uint32 bit = 0;
+		bool found = false;
+	};
+
+	inline uint8* BitByte(void* obj, const BitInfo& b) { return reinterpret_cast<uint8*>(obj) + b.offset + b.bit / 8; }
+	inline bool GetBit(void* obj, const BitInfo& b) { return (*BitByte(obj, b) >> (b.bit % 8)) & 1; }
+	inline void SetBit(void* obj, const BitInfo& b, bool v)
+	{
+		uint8* p = BitByte(obj, b);
+		const uint8 m = static_cast<uint8>(1u << (b.bit % 8));
+		*p = v ? static_cast<uint8>(*p | m) : static_cast<uint8>(*p & ~m);
+	}
+
+	bool ReadBitfieldCache(const std::filesystem::path& file, std::map<std::string, BitInfo>& wanted)
+	{
+		std::ifstream in(file, std::ios::binary);
+		if (!in.good())
+			return false;
+		struct RawBitField
+		{
+			uint64 offset;
+			uint32 bit_position;
+			uint64 num_bits;
+			uint64 length;
+		};
+		static_assert(sizeof(RawBitField) == 32, "BitField layout must match AsaApi's cache format");
+		size_t remaining = 0;
+		for (const auto& [k, v] : wanted)
+			remaining += v.found ? 0 : 1;
+		while (remaining > 0)
+		{
+			size_t keySize = 0;
+			if (!in.read(reinterpret_cast<char*>(&keySize), sizeof(keySize)) || keySize == 0 || keySize > 4096)
+				break;
+			std::string key(keySize, '\0');
+			RawBitField raw{};
+			if (!in.read(key.data(), static_cast<std::streamsize>(keySize)) ||
+				!in.read(reinterpret_cast<char*>(&raw), sizeof(raw)))
+				break;
+			auto it = wanted.find(key);
+			if (it != wanted.end() && !it->second.found && raw.num_bits == 1 && raw.bit_position < 64 && raw.offset < 0x4000)
+			{
+				it->second = BitInfo{raw.offset, raw.bit_position, true};
+				--remaining;
+			}
+		}
+		return remaining == 0;
+	}
+
+	// newest AsaApi bitfield cache first
+	std::vector<std::filesystem::path> BitfieldCacheFiles()
+	{
+		namespace fs = std::filesystem;
+		const fs::path root = fs::path(AsaApi::Tools::GetCurrentDir()) / "ArkApi" / "Cache";
+		std::error_code ec;
+		std::vector<fs::path> files;
+		for (fs::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec))
+			if (it->is_regular_file(ec) && it->path().filename() == "cached_bitfields.cache")
+				files.push_back(it->path());
+		std::sort(files.begin(), files.end(), [](const fs::path& a, const fs::path& b) {
+			std::error_code e1, e2;
+			return fs::last_write_time(a, e1) > fs::last_write_time(b, e2);
+		});
+		return files;
+	}
+
+	bool LoadBitsFromCache(std::map<std::string, BitInfo>& wanted, std::string* fromFile = nullptr)
+	{
+		for (const auto& f : BitfieldCacheFiles())
+		{
+			auto copy = wanted;
+			if (ReadBitfieldCache(f, copy))
+			{
+				wanted = copy;
+				if (fromFile)
+					*fromFile = f.string();
+				return true;
+			}
+		}
+		return false;
+	}
+
+	struct DinoLayout
+	{
+		bool ready = false;  // fast path verified and active
+		bool failed = false; // verification failed: slow path forever
+		int attempts = 0;
+		ptrdiff_t team = 0, tamingTeam = 0, controller = 0, root = 0, classPriv = 0, relLoc = 0;
+		BitInfo dead, boss;
+	};
+	DinoLayout g_dl;
+	std::unordered_map<UClass*, std::string> g_speciesCache;
+
+	template <typename T>
+	inline T& At(void* base, ptrdiff_t off) { return *reinterpret_cast<T*>(reinterpret_cast<char*>(base) + off); }
+
+	inline int Team(APrimalDinoCharacter* d) { return g_dl.ready ? At<int>(d, g_dl.team) : d->TargetingTeamField(); }
+	inline int TamingTeam(APrimalDinoCharacter* d) { return g_dl.ready ? At<int>(d, g_dl.tamingTeam) : d->TamingTeamIDField(); }
+	inline bool Dead(APrimalDinoCharacter* d) { return g_dl.ready ? GetBit(d, g_dl.dead) : d->IsDead(); }
+	inline bool Boss(APrimalDinoCharacter* d) { return g_dl.ready ? GetBit(d, g_dl.boss) : d->bIsBossDino()(); }
+	inline AController* Ctrl(APrimalDinoCharacter* d)
+	{
+		return g_dl.ready ? At<TObjectPtr<AController>>(d, g_dl.controller).Get() : d->ControllerField().Get();
+	}
+	inline FVector Loc(APrimalDinoCharacter* d)
+	{
+		if (g_dl.ready)
+			if (USceneComponent* root = At<TObjectPtr<USceneComponent>>(d, g_dl.root).Get())
+				return At<FVector>(root, g_dl.relLoc);
+		return d->GetLocation();
+	}
+	const std::string& Species(APrimalDinoCharacter* d)
+	{
+		UClass* cls = g_dl.ready ? At<UClass*>(d, g_dl.classPriv) : d->ClassPrivateField();
+		auto it = g_speciesCache.find(cls);
+		if (it != g_speciesCache.end())
+			return it->second;
+		return g_speciesCache.emplace(cls, ShortClassName(d)).first->second;
+	}
+
+	// resolves offsets from real dinos and verifies the fast path against the slow accessors
+	void EnsureDinoLayout(const TArray<AActor*>& dinos)
+	{
+		if (g_dl.ready || g_dl.failed || dinos.Num() == 0 || g_dl.attempts >= 5)
+			return;
+		++g_dl.attempts;
+		APrimalDinoCharacter* first = nullptr;
+		USceneComponent* firstRoot = nullptr;
+		for (AActor* a : dinos)
+		{
+			if (a == nullptr || a->IsPendingKillPending())
+				continue;
+			auto* d = static_cast<APrimalDinoCharacter*>(a);
+			if (USceneComponent* r = d->RootComponentField().Get())
+			{
+				first = d;
+				firstRoot = r;
+				break;
+			}
+		}
+		if (first == nullptr)
+			return;
+
+		DinoLayout l;
+		char* b = reinterpret_cast<char*>(first);
+		l.team = reinterpret_cast<char*>(&first->TargetingTeamField()) - b;
+		l.tamingTeam = reinterpret_cast<char*>(&first->TamingTeamIDField()) - b;
+		l.controller = reinterpret_cast<char*>(&first->ControllerField()) - b;
+		l.root = reinterpret_cast<char*>(&first->RootComponentField()) - b;
+		l.classPriv = reinterpret_cast<char*>(&first->ClassPrivateField()) - b;
+		l.relLoc = reinterpret_cast<char*>(&firstRoot->RelativeLocationField()) - reinterpret_cast<char*>(firstRoot);
+
+		std::map<std::string, BitInfo> bits{{"APrimalCharacter.bIsDead", {}}, {"APrimalDinoCharacter.bIsBossDino", {}}};
+		if (!LoadBitsFromCache(bits))
+		{
+			g_dl.failed = true;
+			Log::GetLog()->warn("Fast dino access unavailable: bit positions not in AsaApi's cache. Using slow accessors.");
+			return;
+		}
+		l.dead = bits["APrimalCharacter.bIsDead"];
+		l.boss = bits["APrimalDinoCharacter.bIsBossDino"];
+
+		// verify on up to 300 live dinos
+		int checked = 0, bad = 0;
+		for (AActor* a : dinos)
+		{
+			if (checked >= 300)
+				break;
+			if (a == nullptr || a->IsPendingKillPending())
+				continue;
+			auto* d = static_cast<APrimalDinoCharacter*>(a);
+			USceneComponent* r = At<TObjectPtr<USceneComponent>>(d, l.root).Get();
+			if (r == nullptr || r != d->RootComponentField().Get())
+				continue;
+			++checked;
+			const bool deadOk = GetBit(d, l.dead) == static_cast<bool>(d->bIsDead()());
+			const bool bossOk = GetBit(d, l.boss) == static_cast<bool>(d->bIsBossDino()());
+			const bool teamOk = At<int>(d, l.team) == d->TargetingTeamField();
+			const bool locOk = FVector::Distance(At<FVector>(r, l.relLoc), d->GetLocation()) < 50.0;
+			if (!(deadOk && bossOk && teamOk && locOk))
+				++bad;
+		}
+		if (checked < 20 || bad > checked / 100)
+		{
+			g_dl.failed = bad > 0;
+			Log::GetLog()->warn("Fast dino access not enabled ({} checked, {} mismatches). Using slow accessors.", checked, bad);
+			return;
+		}
+		l.ready = true;
+		l.attempts = g_dl.attempts;
+		g_dl = l;
+		g_fastActors = true;
+		Log::GetLog()->info("Fast dino access verified on {} dinos ({} mismatches)", checked, bad);
+	}
+
+	struct ScanTimer
+	{
+		const char* what;
+		Clock::time_point start = Clock::now();
+		size_t* count;
+		explicit ScanTimer(const char* w, size_t* n) : what(w), count(n) {}
+		~ScanTimer()
+		{
+			const double ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+			if (ms >= 50.0)
+				Log::GetLog()->info("{} scanned {} actors in {:.0f} ms", what, count ? *count : 0, ms);
+		}
+	};
 
 	// ------------------------------------------------------------------------------------------------ census
 
@@ -533,18 +759,22 @@ namespace PerfGuard
 			return c;
 		c.players = static_cast<int>(LivingPlayerPositions(world).size());
 
-		for (AActor* a : AllActorsOf<APrimalDinoCharacter>(world))
+		const TArray<AActor*> dinos = AllActorsOf<APrimalDinoCharacter>(world);
+		EnsureDinoLayout(dinos);
+		size_t scanCount = static_cast<size_t>(dinos.Num());
+		ScanTimer scanTimer("TakeCensus", &scanCount);
+		for (AActor* a : dinos)
 		{
 			if (!IsUsable(a))
 				continue;
 			auto* dino = static_cast<APrimalDinoCharacter*>(a);
-			const bool wild = dino->TargetingTeamField() < kTamedTeamMin;
-			const bool dead = dino->IsDead();
+			const bool wild = Team(dino) < kTamedTeamMin;
+			const bool dead = Dead(dino);
 			if (wild && !dead)
 			{
 				++c.wildLiving;
 				if (bySpecies)
-					++c.wildBySpecies[ShortClassName(dino)];
+					++c.wildBySpecies[Species(dino)];
 			}
 			else if (wild)
 				++c.wildDead;
@@ -728,20 +958,24 @@ namespace PerfGuard
 		std::map<std::string, int> speciesCount;
 		int wildLiving = 0;
 
-		for (AActor* a : AllActorsOf<APrimalDinoCharacter>(world))
+		const TArray<AActor*> dinos = AllActorsOf<APrimalDinoCharacter>(world);
+		EnsureDinoLayout(dinos);
+		size_t scanCount = static_cast<size_t>(dinos.Num());
+		ScanTimer scanTimer("RunWildCap", &scanCount);
+		for (AActor* a : dinos)
 		{
 			if (!IsUsable(a))
 				continue;
 			auto* dino = static_cast<APrimalDinoCharacter*>(a);
-			if (dino->TargetingTeamField() >= kTamedTeamMin || dino->IsDead())
+			if (Team(dino) >= kTamedTeamMin || Dead(dino))
 				continue;
 			++wildLiving;
-			const std::string species = ShortClassName(dino);
+			const std::string& species = Species(dino);
 			++speciesCount[species];
 
-			if (dino->bIsBossDino()() || dino->IsTaming() || dino->TamingTeamIDField() != 0 || IsExcludedSpecies(species))
+			if (Boss(dino) || TamingTeam(dino) != 0 || IsExcludedSpecies(species))
 				continue;
-			const double dist = NearestPlayerDistance(dino->GetLocation(), players);
+			const double dist = NearestPlayerDistance(Loc(dino), players);
 			if (dist < g_cfg.minDistanceFromPlayers)
 				continue;
 			eligible.push_back({dino, species, dist});
@@ -846,12 +1080,16 @@ namespace PerfGuard
 
 		// dead WILD dinos only. Tamed corpses can hold saddles and gear, so they are never touched.
 		std::map<ActorKey, Clock::time_point> stillDead;
-		for (AActor* a : AllActorsOf<APrimalDinoCharacter>(world))
+		const TArray<AActor*> dinos = AllActorsOf<APrimalDinoCharacter>(world);
+		EnsureDinoLayout(dinos);
+		size_t scanCount = static_cast<size_t>(dinos.Num());
+		ScanTimer scanTimer("RunCleanup", &scanCount);
+		for (AActor* a : dinos)
 		{
 			if (!IsUsable(a))
 				continue;
 			auto* dino = static_cast<APrimalDinoCharacter*>(a);
-			if (dino->TargetingTeamField() >= kTamedTeamMin || !dino->IsDead())
+			if (Team(dino) >= kTamedTeamMin || !Dead(dino))
 				continue;
 			const ActorKey key{a, a->CreationTimeField()};
 			auto it = g_firstSeenDead.find(key);
@@ -860,7 +1098,7 @@ namespace PerfGuard
 
 			const double ageMin = std::chrono::duration<double>(now - first).count() / 60.0;
 			if (budget > 0 && ageMin >= g_cfg.corpseMaxAgeMinutes &&
-				NearestPlayerDistance(a->GetLocation(), players) >= g_cfg.cleanupMinDistanceFromPlayers)
+				NearestPlayerDistance(Loc(dino), players) >= g_cfg.cleanupMinDistanceFromPlayers)
 			{
 				toDestroy.push_back(a);
 				++corpses;
@@ -1071,10 +1309,15 @@ namespace PerfGuard
 		B_Status,      // UPrimalCharacterStatusComponent::TickStatus (nested inside dino/player tick)
 		B_PlayerTick,  // AShooterCharacter::Tick
 		B_GameMode,    // AShooterGameMode::Tick
+		B_ZoneUpdate,  // ANPCZoneManager::UpdateZone (wild spawn zones)
+		B_ZoneCheck,   // ANPCZoneManager::CheckIncreaseNPC (decides whether a zone needs more dinos)
+		B_ZoneSpawn,   // ANPCZoneManager::SpawnNPCs
+		B_HibWake,     // AHibernationManager::AwakenActorsForPlayers (wakes hibernated actors near players)
 		B_Count
 	};
 	const char* kBucketNames[B_Count] = {"world tick", "dino tick", "dino AI", "movement", "pathfinding", "animation",
-		"status (inside dino/player tick)", "player tick", "game mode"};
+		"status (inside dino/player tick)", "player tick", "game mode", "spawn zone update", "spawn zone check",
+		"spawn zone spawning", "hibernation wake-up"};
 
 	// atomics: with experimental threading some hooked ticks can run on worker threads
 	struct BucketStats
@@ -1115,8 +1358,11 @@ namespace PerfGuard
 		Bucket b;
 		int64 start;
 		bool on;
-		explicit ScopedBucket(Bucket bucket)
-			: b(bucket), start(0), on(g_cfg.profilerEnabled && (++t_sampleCounter % kSampleEvery) == 0)
+		int64 weight;
+		// always = time every call (for rare, expensive calls); otherwise sample 1 in kSampleEvery
+		explicit ScopedBucket(Bucket bucket, bool always = false)
+			: b(bucket), start(0), on(g_cfg.profilerEnabled && (always || (++t_sampleCounter % kSampleEvery) == 0)),
+			  weight(always ? 1 : static_cast<int64>(kSampleEvery))
 		{
 			if (on)
 				start = Qpc();
@@ -1125,10 +1371,10 @@ namespace PerfGuard
 		{
 			if (!on)
 				return;
-			const int64 d = (Qpc() - start) * static_cast<int64>(kSampleEvery);
+			const int64 d = (Qpc() - start) * weight;
 			g_prof[b].ticks.fetch_add(d, std::memory_order_relaxed);
 			g_prof[b].frameTicks.fetch_add(d, std::memory_order_relaxed);
-			g_prof[b].calls.fetch_add(kSampleEvery, std::memory_order_relaxed);
+			g_prof[b].calls.fetch_add(weight, std::memory_order_relaxed);
 		}
 	};
 
@@ -1226,15 +1472,18 @@ namespace PerfGuard
 		next.reserve(g_throttle.size() + 64);
 		int t1 = 0, t2 = 0;
 
-		for (AActor* a : AllActorsOf<APrimalDinoCharacter>(world))
+		const TArray<AActor*> dinos = AllActorsOf<APrimalDinoCharacter>(world);
+		EnsureDinoLayout(dinos);
+		size_t scanCount = static_cast<size_t>(dinos.Num());
+		ScanTimer scanTimer("RebuildThrottle", &scanCount);
+		for (AActor* a : dinos)
 		{
 			if (!IsUsable(a))
 				continue;
 			auto* dino = static_cast<APrimalDinoCharacter*>(a);
-			if (dino->TargetingTeamField() >= kTamedTeamMin || dino->IsDead() || dino->bIsBossDino()() || dino->IsTaming() ||
-				dino->TamingTeamIDField() != 0)
+			if (Team(dino) >= kTamedTeamMin || Dead(dino) || Boss(dino) || TamingTeam(dino) != 0)
 				continue;
-			const double dist = NearestPlayerDistance(dino->GetLocation(), players);
+			const double dist = NearestPlayerDistance(Loc(dino), players);
 			int every = 1;
 			if (dist >= g_cfg.tier2Distance)
 			{
@@ -1259,7 +1508,7 @@ namespace PerfGuard
 				next[key] = st;
 			};
 			keep(dino);
-			if (AController* ctrl = dino->ControllerField().Get())
+			if (AController* ctrl = Ctrl(dino))
 				keep(ctrl);
 		}
 		{
@@ -1293,6 +1542,10 @@ namespace PerfGuard
 	DECLARE_HOOK(UPrimalCharacterStatusComponent_TickStatus, void, UPrimalCharacterStatusComponent*, float, bool);
 	DECLARE_HOOK(AShooterCharacter_Tick, void, AShooterCharacter*, float);
 	DECLARE_HOOK(AShooterGameMode_Tick, void, AShooterGameMode*, float);
+	DECLARE_HOOK(ANPCZoneManager_UpdateZone, bool, ANPCZoneManager*);
+	DECLARE_HOOK(ANPCZoneManager_CheckIncreaseNPC, void, ANPCZoneManager*, bool);
+	DECLARE_HOOK(ANPCZoneManager_SpawnNPCs, bool, ANPCZoneManager*);
+	DECLARE_HOOK(AHibernationManager_AwakenActorsForPlayers, void, AHibernationManager*, bool);
 
 	void Hook_UWorld_Tick(UWorld* world, DWORD64 tickType, float dt)
 	{
@@ -1321,7 +1574,7 @@ namespace PerfGuard
 			s << "Hitch inside world tick: " << g_lastWorldTickMs << " ms. Breakdown:";
 			for (int i = B_DinoTick; i < B_Count; ++i)
 				s << " " << kBucketNames[i] << " " << TicksToMs(g_prof[i].frameTicks.load()) << ",";
-			s << " other (Blueprints, structures, network, mods) is the remainder";
+			s << " other (network replication, structures, Blueprints, mods) is the remainder";
 			Log::GetLog()->warn("{}", s.str());
 		}
 	}
@@ -1383,8 +1636,32 @@ namespace PerfGuard
 
 	void Hook_AShooterGameMode_Tick(AShooterGameMode* self, float dt)
 	{
-		ScopedBucket sb(B_GameMode);
+		ScopedBucket sb(B_GameMode, true);
 		AShooterGameMode_Tick_original(self, dt);
+	}
+
+	bool Hook_ANPCZoneManager_UpdateZone(ANPCZoneManager* self)
+	{
+		ScopedBucket sb(B_ZoneUpdate, true);
+		return ANPCZoneManager_UpdateZone_original(self);
+	}
+
+	void Hook_ANPCZoneManager_CheckIncreaseNPC(ANPCZoneManager* self, bool force)
+	{
+		ScopedBucket sb(B_ZoneCheck, true);
+		ANPCZoneManager_CheckIncreaseNPC_original(self, force);
+	}
+
+	bool Hook_ANPCZoneManager_SpawnNPCs(ANPCZoneManager* self)
+	{
+		ScopedBucket sb(B_ZoneSpawn, true);
+		return ANPCZoneManager_SpawnNPCs_original(self);
+	}
+
+	void Hook_AHibernationManager_AwakenActorsForPlayers(AHibernationManager* self, bool syncLoad)
+	{
+		ScopedBucket sb(B_HibWake, true);
+		AHibernationManager_AwakenActorsForPlayers_original(self, syncLoad);
 	}
 
 	int64 g_printBlocked = 0; // log filter disabled: see README (PrintString hook crashed on ARK 97.21)
@@ -1418,6 +1695,14 @@ namespace PerfGuard
 				reinterpret_cast<LPVOID*>(&UPrimalCharacterStatusComponent_TickStatus_original), true},
 			{"AShooterCharacter.Tick(float)", reinterpret_cast<LPVOID>(&Hook_AShooterCharacter_Tick),
 				reinterpret_cast<LPVOID*>(&AShooterCharacter_Tick_original), true},
+			{"ANPCZoneManager.UpdateZone()", reinterpret_cast<LPVOID>(&Hook_ANPCZoneManager_UpdateZone),
+				reinterpret_cast<LPVOID*>(&ANPCZoneManager_UpdateZone_original), true},
+			{"ANPCZoneManager.CheckIncreaseNPC(bool)", reinterpret_cast<LPVOID>(&Hook_ANPCZoneManager_CheckIncreaseNPC),
+				reinterpret_cast<LPVOID*>(&ANPCZoneManager_CheckIncreaseNPC_original), true},
+			{"ANPCZoneManager.SpawnNPCs()", reinterpret_cast<LPVOID>(&Hook_ANPCZoneManager_SpawnNPCs),
+				reinterpret_cast<LPVOID*>(&ANPCZoneManager_SpawnNPCs_original), true},
+			{"AHibernationManager.AwakenActorsForPlayers(bool)", reinterpret_cast<LPVOID>(&Hook_AHibernationManager_AwakenActorsForPlayers),
+				reinterpret_cast<LPVOID*>(&AHibernationManager_AwakenActorsForPlayers_original), true},
 			{"AShooterGameMode.Tick(float)", reinterpret_cast<LPVOID>(&Hook_AShooterGameMode_Tick),
 				reinterpret_cast<LPVOID*>(&AShooterGameMode_Tick_original), true},
 		};
@@ -1465,94 +1750,28 @@ namespace PerfGuard
 	// from there instead of guessing. Flipping it makes the chosen ticks run in parallel with the game thread.
 	// ARK's code was never written for that, so expect crashes: this is a measured experiment, off by default.
 
-	struct BitInfo
-	{
-		uint64 offset = 0;
-		uint32 bit = 0;
-		bool found = false;
-	};
 	BitInfo g_bitAnyThread;
 	BitInfo g_bitCanEverTick;
 	std::string g_layoutStatus = "not loaded";
 
-	bool ReadBitfieldCache(const std::filesystem::path& file, std::map<std::string, BitInfo>& wanted)
-	{
-		std::ifstream in(file, std::ios::binary);
-		if (!in.good())
-			return false;
-		struct RawBitField
-		{
-			uint64 offset;
-			uint32 bit_position;
-			uint64 num_bits;
-			uint64 length;
-		};
-		static_assert(sizeof(RawBitField) == 32, "BitField layout must match AsaApi's cache format");
-		size_t remaining = wanted.size();
-		while (remaining > 0)
-		{
-			size_t keySize = 0;
-			if (!in.read(reinterpret_cast<char*>(&keySize), sizeof(keySize)) || keySize == 0 || keySize > 4096)
-				break;
-			std::string key(keySize, '\0');
-			RawBitField raw{};
-			if (!in.read(key.data(), static_cast<std::streamsize>(keySize)) ||
-				!in.read(reinterpret_cast<char*>(&raw), sizeof(raw)))
-				break;
-			auto it = wanted.find(key);
-			if (it != wanted.end() && !it->second.found && raw.num_bits == 1 && raw.bit_position < 64 && raw.offset < 0x400)
-			{
-				it->second = BitInfo{raw.offset, raw.bit_position, true};
-				--remaining;
-			}
-		}
-		return remaining == 0;
-	}
-
 	void LoadTickLayout()
 	{
-		namespace fs = std::filesystem;
-		const fs::path root = fs::path(AsaApi::Tools::GetCurrentDir()) / "ArkApi" / "Cache";
-		std::error_code ec;
-		std::vector<fs::path> files;
-		for (fs::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec))
-			if (it->is_regular_file(ec) && it->path().filename() == "cached_bitfields.cache")
-				files.push_back(it->path());
-		std::sort(files.begin(), files.end(), [](const fs::path& a, const fs::path& b) {
-			std::error_code e1, e2;
-			return fs::last_write_time(a, e1) > fs::last_write_time(b, e2); // newest first
-		});
-
-		for (const auto& f : files)
+		std::map<std::string, BitInfo> wanted{{"FTickFunction.bRunOnAnyThread", {}}, {"FTickFunction.bCanEverTick", {}}};
+		std::string file;
+		if (LoadBitsFromCache(wanted, &file))
 		{
-			std::map<std::string, BitInfo> wanted{{"FTickFunction.bRunOnAnyThread", {}}, {"FTickFunction.bCanEverTick", {}}};
-			if (ReadBitfieldCache(f, wanted))
-			{
-				g_bitAnyThread = wanted["FTickFunction.bRunOnAnyThread"];
-				g_bitCanEverTick = wanted["FTickFunction.bCanEverTick"];
-				std::ostringstream s;
-				s << "tick layout from " << f.string() << ": bRunOnAnyThread at +" << g_bitAnyThread.offset << " bit "
-				  << g_bitAnyThread.bit << ", bCanEverTick at +" << g_bitCanEverTick.offset << " bit " << g_bitCanEverTick.bit;
-				g_layoutStatus = s.str();
-				Log::GetLog()->info("Experimental threading: {}", g_layoutStatus);
-				return;
-			}
+			g_bitAnyThread = wanted["FTickFunction.bRunOnAnyThread"];
+			g_bitCanEverTick = wanted["FTickFunction.bCanEverTick"];
+			std::ostringstream s;
+			s << "tick layout from " << file << ": bRunOnAnyThread at +" << g_bitAnyThread.offset << " bit "
+			  << g_bitAnyThread.bit << ", bCanEverTick at +" << g_bitCanEverTick.offset << " bit " << g_bitCanEverTick.bit;
+			g_layoutStatus = s.str();
+			Log::GetLog()->info("Experimental threading: {}", g_layoutStatus);
+			return;
 		}
-		g_layoutStatus = files.empty() ? "no AsaApi bitfield cache found under ArkApi/Cache"
+		g_layoutStatus = BitfieldCacheFiles().empty() ? "no AsaApi bitfield cache found under ArkApi/Cache"
 			: "FTickFunction bits not present in AsaApi's cache";
 		Log::GetLog()->warn("Experimental threading unavailable: {}", g_layoutStatus);
-	}
-
-	inline uint8* BitByte(void* tickFn, const BitInfo& b)
-	{
-		return reinterpret_cast<uint8*>(tickFn) + b.offset + b.bit / 8;
-	}
-	inline bool GetBit(void* tickFn, const BitInfo& b) { return (*BitByte(tickFn, b) >> (b.bit % 8)) & 1; }
-	inline void SetBit(void* tickFn, const BitInfo& b, bool v)
-	{
-		uint8* p = BitByte(tickFn, b);
-		const uint8 m = static_cast<uint8>(1u << (b.bit % 8));
-		*p = v ? static_cast<uint8>(*p | m) : static_cast<uint8>(*p & ~m);
 	}
 
 	std::unordered_map<void*, bool> g_anyThreadFlipped; // tick function -> original bit value
@@ -1565,7 +1784,7 @@ namespace PerfGuard
 		if (g_cfg.mtDinoActorTick)
 			out.push_back(&dino->PrimaryActorTickField());
 		if (g_cfg.mtDinoController)
-			if (AController* ctrl = dino->ControllerField().Get())
+			if (AController* ctrl = Ctrl(dino))
 				out.push_back(&ctrl->PrimaryActorTickField());
 		if (g_cfg.mtDinoMovement)
 			if (UCharacterMovementComponent* mv = dino->CharacterMovementField().Get())
@@ -1599,7 +1818,11 @@ namespace PerfGuard
 		std::unordered_set<void*> desired; // the ones that should run on worker threads
 		std::vector<void*> fns;
 
-		for (AActor* a : AllActorsOf<APrimalDinoCharacter>(world))
+		const TArray<AActor*> dinos = AllActorsOf<APrimalDinoCharacter>(world);
+		EnsureDinoLayout(dinos);
+		size_t scanCount = static_cast<size_t>(dinos.Num());
+		ScanTimer scanTimer("UpdateAnyThread", &scanCount);
+		for (AActor* a : dinos)
 		{
 			if (!IsUsable(a))
 				continue;
@@ -1609,13 +1832,13 @@ namespace PerfGuard
 			for (void* fn : fns)
 				alive.insert(fn);
 
-			if (!want || dino->IsDead() || dino->bIsBossDino()())
+			if (!want || Dead(dino) || Boss(dino))
 				continue;
-			const bool wild = dino->TargetingTeamField() < kTamedTeamMin;
+			const bool wild = Team(dino) < kTamedTeamMin;
 			if (!wild && !g_cfg.mtIncludeTamed)
 				continue;
 			if (g_cfg.mtOnlyBeyondDistance > 0.0 &&
-				NearestPlayerDistance(dino->GetLocation(), players) < g_cfg.mtOnlyBeyondDistance)
+				NearestPlayerDistance(Loc(dino), players) < g_cfg.mtOnlyBeyondDistance)
 				continue;
 			for (void* fn : fns)
 				desired.insert(fn);

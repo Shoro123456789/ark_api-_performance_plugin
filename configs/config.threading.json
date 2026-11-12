@@ -129,7 +129,7 @@
     "Enabled": true
   },
   "DistanceThrottle": {
-    "Enabled": true,
+    "Enabled": false,
     "Tier1Distance": 10000,
     "Tier1EveryNFrames": 3,
     "Tier2Distance": 25000,
