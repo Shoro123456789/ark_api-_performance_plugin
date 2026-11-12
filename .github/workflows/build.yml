@@ -79,6 +79,18 @@ jobs:
         shell: pwsh
         run: msbuild PerfGuard.sln /m /p:Configuration=Release /p:Platform=x64 /p:VcpkgRoot="$env:VCPKG_ROOT\" /p:VcpkgEnableManifest=true
 
+      - name: Symbolize crash addresses (crash_rvas.txt)
+        if: hashFiles('crash_rvas.txt') != ''
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $sym = "C:\Program Files\LLVM\bin\llvm-symbolizer.exe"
+          foreach ($rva in Get-Content crash_rvas.txt) {
+            if (-not $rva.Trim()) { continue }
+            Write-Host "=== RVA $rva"
+            & $sym --obj=out/PerfGuard.dll --relative-address --inlines --pretty-print $rva.Trim()
+          }
+
       - name: Package
         shell: pwsh
         run: |
