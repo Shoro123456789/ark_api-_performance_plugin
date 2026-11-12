@@ -82,6 +82,7 @@ jobs:
           Copy-Item out/PerfGuard.dll $pkg
           Copy-Item configs/PluginInfo.json $pkg
           Copy-Item configs/config.json $pkg
+          Copy-Item configs/config.performance.json $pkg
           Copy-Item README.md package/
           Compress-Archive -Path package/* -DestinationPath PerfGuard.zip -Force
 

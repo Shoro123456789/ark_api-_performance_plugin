@@ -9,11 +9,20 @@ An [AsaApi](https://github.com/ArkServerApi/AsaApi) plugin for ARK: Survival Asc
 | Stale cleanup | Removes wild corpses that have been dead 20+ minutes and dropped items older than 60 minutes. Both must be at least 150 m from every player. It never touches eggs, tamed corpses, player death caches or player-dropped items. | On |
 | Scheduled restart | Warns players at 30/15/10/5/1 minutes, saves the world, then exits. Your panel's crash detection restarts the server. | Off |
 | Engine console variables | Applies a list of `cvar value` commands at startup. Low-risk animation-threading cvars are on. Experimental ones are listed but off. | On |
+| Profiler | Times dino tick, dino AI, movement, pathfinding, animation, status, player tick and game mode tick. Logs ms per frame every report and breaks down every hitch. | On |
+| Distance throttle | Wild dinos 100–250 m from every player update every 3rd frame, beyond 250 m every 15th frame (actor tick, AI, pathfinding, movement and animation). Skipped time is passed on at the next update, so they don't fall behind. | Off |
+| Idle mode | After 2 minutes with nobody online, caps the server at 10 FPS. Restores 30 FPS as soon as someone connects. | On |
+| Empty-server maintenance | After 5 minutes empty, requests a full garbage collection (at most every 15 minutes), so the freeze never hits a player. | On |
+| Restart window | Restarts the first time the server has been empty for 5 minutes between `WindowStart` and `WindowEnd`. If people play through the window, it counts down with warnings to `WindowEnd`. | Off |
+| Log filter | Drops Blueprint `PrintString` messages containing any `BlockContains` text, e.g. `CS Cast Failed`. | On |
+| Game thread | Optional thread priority (`1` above normal, `2` highest, `3` time critical) and CPU affinity mask for the main game thread. | Off |
 
 ## Install
 
 1. Download `PerfGuard.zip` from the latest successful **Actions** run (Artifacts) or from **Releases**.
-2. Copy the `PerfGuard` folder into `ShooterGame/Binaries/Win64/ArkApi/Plugins/`. That folder holds `PerfGuard.dll`, `PluginInfo.json` and `config.json`.
+2. Copy the `PerfGuard` folder into `ShooterGame/Binaries/Win64/ArkApi/Plugins/`. That folder holds `PerfGuard.dll`, `PluginInfo.json`, `config.json` and `config.performance.json`.
+   - `config.json` is the cautious default (removals in dry-run, throttle off).
+   - `config.performance.json` is the aggressive preset. To use it, rename it to `config.json`.
 3. Restart the server. AsaApi logs go to `ShooterGame/Binaries/Win64/logs/ArkApi_<pid>.log`. Look for lines tagged `[PerfGuard]`.
 
 ## RCON / panel console commands
@@ -27,6 +36,7 @@ An [AsaApi](https://github.com/ArkServerApi/AsaApi) plugin for ARK: Survival Asc
 | `perf.exec <cmd>` | Run any console command, e.g. `perf.exec a.ParallelAnimUpdate 1` |
 | `perf.restart <min>` / `perf.restart cancel` | Start or cancel a restart countdown |
 | `perf.reload` | Reload `config.json` and re-apply cvars |
+| `perf.profile` | Profiler breakdown, throttle counts, players online, idle state, blocked log messages |
 
 ## Measuring a change
 
@@ -35,6 +45,8 @@ An [AsaApi](https://github.com/ArkServerApi/AsaApi) plugin for ARK: Survival Asc
 3. Compare the next day's `Tick:` lines at a similar player count. **avg ms** is general load. **p99 / worst** are the hitches players feel.
 
 ## Config notes
+
+- **Restart needed for hooks:** turning `Profiler`, `DistanceThrottle` or `LogFilter` on or off in the config needs a server restart. The hooks are installed at load. Their settings, like distances and frame counts, apply on `perf.reload`.
 
 - **Units:** distances are Unreal units, where 100 = 1 m and one foundation = 300.
 - **`WildDinoCap.MaxWildDinos`:** set a fixed cap instead of the learned baseline (0 = automatic).
