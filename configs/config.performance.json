@@ -6,7 +6,7 @@
     "HitchLogMs": 500
   },
   "WildDinoCap": {
-    "Enabled": true,
+    "Enabled": false,
     "DryRun": false,
     "MaxWildDinos": 0,
     "AutoBaselineStartMinutes": 10,
@@ -17,6 +17,12 @@
     "MinDistanceFromPlayers": 20000,
     "MaxRemovalsPerPass": 150,
     "ExcludeSpecies": []
+  },
+  "SpawnGate": {
+    "Enabled": true,
+    "MaxWild": 48000,
+    "ResumePercent": 97,
+    "ScanSeconds": 15
   },
   "Cleanup": {
     "Enabled": true,

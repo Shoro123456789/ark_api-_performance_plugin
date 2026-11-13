@@ -1,7 +1,7 @@
 {
     "FullName": "PerfGuard",
     "Description": "Tick monitor, wild overspawn cap, stale corpse/item cleanup, scheduled restarts and engine cvar tuning",
-    "Version": 2.5,
+    "Version": 2.6,
     "MinApiVersion": 2.11,
     "Dependencies": []
 }

@@ -83,6 +83,12 @@ namespace PerfGuard
 		int maxRemovalsPerPass = 150;
 		std::vector<std::string> excludeSpecies;
 
+		// spawn gate: stops wild spawning once the population reaches a limit (nothing is deleted)
+		bool gateEnabled = false;
+		int gateMaxWild = 45000;
+		int gateResumePercent = 97;  // reopen when the count falls below this % of the limit
+		int gateScanSeconds = 15;
+
 		// cleanup
 		bool cleanupEnabled = true;
 		bool cleanupDryRun = true; // safe first run: log only
@@ -196,6 +202,12 @@ namespace PerfGuard
     "MaxRemovalsPerPass": 150,
     "ExcludeSpecies": []
   },
+  "SpawnGate": {
+    "Enabled": false,
+    "MaxWild": 45000,
+    "ResumePercent": 97,
+    "ScanSeconds": 15
+  },
   "Cleanup": {
     "Enabled": true,
     "DryRun": true,
@@ -308,6 +320,14 @@ namespace PerfGuard
 			Read(j, "MaxRemovalsPerPass", c.maxRemovalsPerPass);
 			Read(j, "ExcludeSpecies", c.excludeSpecies);
 		}
+		if (root.contains("SpawnGate"))
+		{
+			const auto& j = root["SpawnGate"];
+			Read(j, "Enabled", c.gateEnabled);
+			Read(j, "MaxWild", c.gateMaxWild);
+			Read(j, "ResumePercent", c.gateResumePercent);
+			Read(j, "ScanSeconds", c.gateScanSeconds);
+		}
 		if (root.contains("Cleanup"))
 		{
 			const auto& j = root["Cleanup"];
@@ -419,6 +439,9 @@ namespace PerfGuard
 		c.cleanupIntervalSeconds = (std::max)(60, c.cleanupIntervalSeconds);
 		c.autoHeadroomPercent = (std::max)(5, c.autoHeadroomPercent);
 		c.autoBaselineEndMinutes = (std::max)(c.autoBaselineStartMinutes + 1, c.autoBaselineEndMinutes);
+		c.gateMaxWild = (std::max)(1000, c.gateMaxWild);
+		c.gateResumePercent = (std::min)(100, (std::max)(50, c.gateResumePercent));
+		c.gateScanSeconds = (std::max)(5, c.gateScanSeconds);
 		c.maxRemovalsPerPass = std::clamp(c.maxRemovalsPerPass, 1, 2000);
 		c.maxCleanupPerPass = std::clamp(c.maxCleanupPerPass, 1, 2000);
 		c.saveToExitDelaySeconds = std::clamp(c.saveToExitDelaySeconds, 5, 600);
@@ -1356,6 +1379,7 @@ namespace PerfGuard
 	int64 g_qpcFreq = 1;
 	Clock::time_point g_lastWorldHitchLog{};
 	bool g_tickHooksInstalled = false;
+	bool g_gateHooksInstalled = false;
 	bool g_printHookInstalled = false;
 
 	inline int64 Qpc()
@@ -1660,6 +1684,10 @@ namespace PerfGuard
 		AShooterGameMode_Tick_original(self, dt);
 	}
 
+	std::atomic<bool> g_gateClosed{false};
+	std::atomic<int> g_gateWild{0};
+	std::atomic<int64> g_gateBlocked{0};
+
 	bool Hook_ANPCZoneManager_UpdateZone(ANPCZoneManager* self)
 	{
 		ScopedBucket sb(B_ZoneUpdate, true);
@@ -1668,12 +1696,22 @@ namespace PerfGuard
 
 	void Hook_ANPCZoneManager_CheckIncreaseNPC(ANPCZoneManager* self, bool force)
 	{
+		if (g_gateClosed.load(std::memory_order_relaxed))
+		{
+			g_gateBlocked.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
 		ScopedBucket sb(B_ZoneCheck, true);
 		ANPCZoneManager_CheckIncreaseNPC_original(self, force);
 	}
 
 	bool Hook_ANPCZoneManager_SpawnNPCs(ANPCZoneManager* self)
 	{
+		if (g_gateClosed.load(std::memory_order_relaxed))
+		{
+			g_gateBlocked.fetch_add(1, std::memory_order_relaxed);
+			return false;
+		}
 		ScopedBucket sb(B_ZoneSpawn, true);
 		return ANPCZoneManager_SpawnNPCs_original(self);
 	}
@@ -1824,6 +1862,23 @@ namespace PerfGuard
 			else
 				Log::GetLog()->error("Could not hook {}", h.name);
 		}
+		if (!wantTick && g_cfg.gateEnabled)
+		{
+			// the spawn gate needs only the two spawn-zone hooks
+			for (const auto& h : HookList())
+			{
+				const std::string n = h.name;
+				if (n != "ANPCZoneManager.CheckIncreaseNPC(bool)" && n != "ANPCZoneManager.SpawnNPCs()")
+					continue;
+				if (AsaApi::GetHooks().SetHook(h.name, h.detour, h.original))
+				{
+					++ok;
+					g_gateHooksInstalled = true;
+				}
+				else
+					Log::GetLog()->error("Could not hook {}", h.name);
+			}
+		}
 		g_tickHooksInstalled = wantTick;
 		g_printHookInstalled = wantPrint;
 		Log::GetLog()->info("Installed {} hook(s) (tick hooks {}, log filter {})", ok, wantTick ? "on" : "off",
@@ -1837,6 +1892,17 @@ namespace PerfGuard
 			if ((h.tickGroup && g_tickHooksInstalled) || (!h.tickGroup && g_printHookInstalled))
 				AsaApi::GetHooks().DisableHook(h.name, h.detour);
 		}
+		if (g_gateHooksInstalled)
+		{
+			for (const auto& h : HookList())
+			{
+				const std::string n = h.name;
+				if (n == "ANPCZoneManager.CheckIncreaseNPC(bool)" || n == "ANPCZoneManager.SpawnNPCs()")
+					AsaApi::GetHooks().DisableHook(h.name, h.detour);
+			}
+			g_gateHooksInstalled = false;
+		}
+		g_gateClosed.store(false);
 		g_tickHooksInstalled = g_printHookInstalled = false;
 	}
 
@@ -2149,6 +2215,58 @@ namespace PerfGuard
 		}
 	}
 
+	// ------------------------------------------------------------------------------------------------ spawn gate
+
+	// Counts living wild dinos and opens or closes the spawn gate. Hysteresis keeps it from flapping.
+	void UpdateSpawnGate()
+	{
+		if (!g_cfg.gateEnabled)
+		{
+			g_gateClosed.store(false);
+			return;
+		}
+		UWorld* world = World();
+		if (world == nullptr)
+			return;
+		const TArray<AActor*> dinos = AllActorsOf<APrimalDinoCharacter>(world);
+		EnsureDinoLayout(dinos);
+		size_t scanCount = static_cast<size_t>(dinos.Num());
+		ScanTimer scanTimer("SpawnGate", &scanCount);
+		int wild = 0;
+		for (AActor* a : dinos)
+		{
+			if (!IsUsable(a))
+				continue;
+			auto* dino = static_cast<APrimalDinoCharacter*>(a);
+			if (Team(dino) < kTamedTeamMin && !Dead(dino))
+				++wild;
+		}
+		g_gateWild.store(wild);
+		const int limit = g_cfg.gateMaxWild;
+		const int resume = static_cast<int>(static_cast<int64>(limit) * g_cfg.gateResumePercent / 100);
+		const bool closed = g_gateClosed.load();
+		if (!closed && wild >= limit)
+		{
+			g_gateClosed.store(true);
+			Log::GetLog()->info("Spawn gate closed: {} wild dinos reached the limit of {}", wild, limit);
+		}
+		else if (closed && wild < resume)
+		{
+			g_gateClosed.store(false);
+			Log::GetLog()->info("Spawn gate reopened: {} wild dinos (resume below {})", wild, resume);
+		}
+	}
+
+	std::string GateSummary()
+	{
+		if (!g_cfg.gateEnabled)
+			return "Spawn gate off";
+		std::ostringstream s;
+		s << "Spawn gate " << (g_gateClosed.load() ? "CLOSED" : "open") << ": " << g_gateWild.load() << " / " << g_cfg.gateMaxWild
+		  << " wild dinos, " << g_gateBlocked.load() << " spawn calls blocked" << (g_gateHooksInstalled || g_tickHooksInstalled ? "" : " (hooks not installed: restart needed)");
+		return s.str();
+	}
+
 	// ------------------------------------------------------------------------------------------------ timers
 
 	int g_seconds = 0;
@@ -2184,6 +2302,8 @@ namespace PerfGuard
 					Log::GetLog()->info("{}", BlueprintSummary(true));
 				if (g_tickHooksInstalled && g_cfg.profilerEnabled)
 					Log::GetLog()->info("{}", ProfileSummary(true));
+				if (g_cfg.gateEnabled)
+					Log::GetLog()->info("{}", GateSummary());
 				if (g_cfg.mtEnabled)
 					Log::GetLog()->info("{}", ThreadingSummary());
 				if (g_cfg.throttleEnabled)
@@ -2197,6 +2317,10 @@ namespace PerfGuard
 					g_printBlocked = 0;
 				}
 			}
+			if (g_cfg.gateEnabled && g_seconds % g_cfg.gateScanSeconds == 0)
+				UpdateSpawnGate();
+			else if (!g_cfg.gateEnabled && g_gateClosed.load())
+				g_gateClosed.store(false);
 			if (g_seconds % g_cfg.capCheckIntervalSeconds == 0)
 				RunWildCap(false);
 			if (g_cfg.cleanupEnabled && g_seconds % g_cfg.cleanupIntervalSeconds == 0)
@@ -2238,12 +2362,21 @@ namespace PerfGuard
 
 	void RconStats(RCONClientConnection* conn, RCONPacket* packet, UWorld*)
 	{
-		Reply(conn, packet, "Last report: " + g_lastReport + "\nNow: " + BuildReport(false));
+		Reply(conn, packet, "Last report: " + g_lastReport + "\nNow: " + BuildReport(false) + "\n" + GateSummary());
 	}
 
 	void RconDinos(RCONClientConnection* conn, RCONPacket* packet, UWorld*)
 	{
-		const Census c = TakeCensus(World(), true);
+		Census c;
+		try
+		{
+			c = TakeCensus(World(), true);
+		}
+		catch (const std::exception& e)
+		{
+			Reply(conn, packet, std::string("perf.dinos failed: ") + e.what());
+			return;
+		}
 		std::ostringstream s;
 		const int cap = CurrentCap();
 		s << "Wild living " << c.wildLiving << ", wild corpses " << c.wildDead << ", tamed " << c.tamedLiving << ", cap "

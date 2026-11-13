@@ -11,6 +11,7 @@ An [AsaApi](https://github.com/ArkServerApi/AsaApi) plugin for ARK: Survival Asc
 | Engine console variables | Applies a list of `cvar value` commands at startup. Low-risk animation-threading cvars are on. Experimental ones are listed but off. | On |
 | Profiler | Times dino tick, dino AI, movement, pathfinding, animation, status, player tick and game mode tick. Logs ms per frame every report and breaks down every hitch. | On |
 | Distance throttle | Wild dinos 100–250 m from every player update every 3rd frame, beyond 250 m every 15th frame (actor tick, AI, pathfinding, movement and animation). Skipped time is passed on at the next update, so they don't fall behind. | Off |
+| Spawn gate | Stops wild spawn zones from spawning once the living wild count reaches `MaxWild`. Nothing is deleted, so there is no remove-and-respawn loop. Reopens below `ResumePercent` of the limit. Needs a restart to turn on. | Off (on in the performance presets) |
 | Idle mode | After 2 minutes with nobody online, caps the server at 10 FPS. Restores 30 FPS as soon as someone connects. | On |
 | Empty-server maintenance | After 5 minutes empty, requests a full garbage collection (at most every 15 minutes), so the freeze never hits a player. | On |
 | Restart window | Restarts the first time the server has been empty for 5 minutes between `WindowStart` and `WindowEnd`. If people play through the window, it counts down with warnings to `WindowEnd`. | Off |

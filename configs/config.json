@@ -18,6 +18,12 @@
     "MaxRemovalsPerPass": 150,
     "ExcludeSpecies": []
   },
+  "SpawnGate": {
+    "Enabled": false,
+    "MaxWild": 45000,
+    "ResumePercent": 97,
+    "ScanSeconds": 15
+  },
   "Cleanup": {
     "Enabled": true,
     "DryRun": true,
