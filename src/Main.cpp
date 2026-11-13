@@ -141,6 +141,11 @@ namespace PerfGuard
 		int threadPriority = 0;      // 0 = leave, 1 = above normal, 2 = highest, 3 = time critical
 		uint64 threadAffinityMask = 0; // 0 = leave
 
+		// Blueprint profiler
+		bool bpEnabled = true;
+		int bpSampleEvery = 16;
+		int bpTopN = 15;
+
 		// experimental threading
 		bool mtEnabled = false;
 		bool mtDinoActorTick = true;
@@ -258,6 +263,11 @@ namespace PerfGuard
     "Priority": 0,
     "AffinityMask": 0
   },
+  "BlueprintProfiler": {
+    "Enabled": true,
+    "SampleEvery": 16,
+    "TopN": 15
+  },
   "ExperimentalThreading": {
     "Enabled": false,
     "DinoActorTick": true,
@@ -360,6 +370,13 @@ namespace PerfGuard
 			Read(j, "Priority", c.threadPriority);
 			Read(j, "AffinityMask", c.threadAffinityMask);
 		}
+		if (root.contains("BlueprintProfiler"))
+		{
+			const auto& j = root["BlueprintProfiler"];
+			Read(j, "Enabled", c.bpEnabled);
+			Read(j, "SampleEvery", c.bpSampleEvery);
+			Read(j, "TopN", c.bpTopN);
+		}
 		if (root.contains("ExperimentalThreading"))
 		{
 			const auto& j = root["ExperimentalThreading"];
@@ -419,6 +436,8 @@ namespace PerfGuard
 		c.windowEmptyForMinutes = (std::max)(1, c.windowEmptyForMinutes);
 		c.threadPriority = std::clamp(c.threadPriority, 0, 3);
 		c.mtScanSeconds = std::clamp(c.mtScanSeconds, 2, 300);
+		c.bpSampleEvery = std::clamp(c.bpSampleEvery, 1, 1000);
+		c.bpTopN = std::clamp(c.bpTopN, 1, 50);
 
 		g_cfg = c;
 	}
@@ -1546,6 +1565,7 @@ namespace PerfGuard
 	DECLARE_HOOK(ANPCZoneManager_CheckIncreaseNPC, void, ANPCZoneManager*, bool);
 	DECLARE_HOOK(ANPCZoneManager_SpawnNPCs, bool, ANPCZoneManager*);
 	DECLARE_HOOK(AHibernationManager_AwakenActorsForPlayers, void, AHibernationManager*, bool);
+	DECLARE_HOOK(UObject_ProcessEvent, void, UObject*, UFunction*, void*);
 
 	void Hook_UWorld_Tick(UWorld* world, DWORD64 tickType, float dt)
 	{
@@ -1664,6 +1684,82 @@ namespace PerfGuard
 		AHibernationManager_AwakenActorsForPlayers_original(self, syncLoad);
 	}
 
+	// ---- Blueprint profiler
+	// Every Blueprint event that native code triggers (ReceiveTick, timers, delegates, mod logic) enters through
+	// UObject::ProcessEvent. Only outermost calls are timed, so nested Blueprint calls are counted inside their caller.
+	// Mods are Blueprint-only, so the function path shows which mod a cost belongs to.
+	struct BpStat
+	{
+		int64 ticks = 0;
+		int64 calls = 0;
+	};
+	std::mutex g_bpMutex;
+	std::unordered_map<UFunction*, BpStat> g_bpStats;
+	std::atomic<int64> g_bpTotalTicks{0};
+	thread_local int t_peDepth = 0;
+	thread_local uint32 t_peSample = 0;
+
+	void Hook_UObject_ProcessEvent(UObject* self, UFunction* fn, void* parms)
+	{
+		const bool sample = g_cfg.bpEnabled && t_peDepth == 0 && fn != nullptr &&
+			(++t_peSample % static_cast<uint32>(g_cfg.bpSampleEvery)) == 0;
+		++t_peDepth;
+		if (!sample)
+		{
+			UObject_ProcessEvent_original(self, fn, parms);
+			--t_peDepth;
+			return;
+		}
+		const int64 start = Qpc();
+		UObject_ProcessEvent_original(self, fn, parms);
+		const int64 d = (Qpc() - start) * g_cfg.bpSampleEvery;
+		--t_peDepth;
+		g_bpTotalTicks.fetch_add(d, std::memory_order_relaxed);
+		std::lock_guard lock(g_bpMutex);
+		BpStat& st = g_bpStats[fn];
+		st.ticks += d;
+		st.calls += g_cfg.bpSampleEvery;
+	}
+
+	std::string FunctionPath(UFunction* fn)
+	{
+		if (fn == nullptr)
+			return "?";
+		FString out;
+		fn->GetPathName(nullptr, out);
+		std::string p = out.ToString();
+		// "/Game/Mods/SomeMod/Blueprints/BP_Thing.BP_Thing_C:ReceiveTick" -> keep it short but keep the mod folder
+		if (p.rfind("/Game/", 0) == 0)
+			p = p.substr(6);
+		return p;
+	}
+
+	std::string BlueprintSummary(bool reset)
+	{
+		if (!g_cfg.bpEnabled || !g_tickHooksInstalled)
+			return "Blueprint profiler off";
+		std::vector<std::pair<UFunction*, BpStat>> rows;
+		{
+			std::lock_guard lock(g_bpMutex);
+			rows.assign(g_bpStats.begin(), g_bpStats.end());
+			if (reset)
+				g_bpStats.clear();
+		}
+		const int64 frames = (std::max)(g_profFrames, static_cast<int64>(1));
+		std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.ticks > b.second.ticks; });
+		std::ostringstream s;
+		s.setf(std::ios::fixed);
+		s.precision(2);
+		s << "Blueprint events (sampled 1 in " << g_cfg.bpSampleEvery << "), total "
+		  << TicksToMs(g_bpTotalTicks.load()) / static_cast<double>(frames) << " ms per frame. Top " << g_cfg.bpTopN << ":";
+		for (size_t i = 0; i < rows.size() && i < static_cast<size_t>(g_cfg.bpTopN); ++i)
+			s << "\n  " << TicksToMs(rows[i].second.ticks) / static_cast<double>(frames) << " ms/frame, "
+			  << rows[i].second.calls / frames << " calls/frame  " << FunctionPath(rows[i].first);
+		if (reset)
+			g_bpTotalTicks.store(0);
+		return s.str();
+	}
+
 	int64 g_printBlocked = 0; // log filter disabled: see README (PrintString hook crashed on ARK 97.21)
 
 	struct HookDef
@@ -1703,6 +1799,8 @@ namespace PerfGuard
 				reinterpret_cast<LPVOID*>(&ANPCZoneManager_SpawnNPCs_original), true},
 			{"AHibernationManager.AwakenActorsForPlayers(bool)", reinterpret_cast<LPVOID>(&Hook_AHibernationManager_AwakenActorsForPlayers),
 				reinterpret_cast<LPVOID*>(&AHibernationManager_AwakenActorsForPlayers_original), true},
+			{"UObject.ProcessEvent(UFunction*,void*)", reinterpret_cast<LPVOID>(&Hook_UObject_ProcessEvent),
+				reinterpret_cast<LPVOID*>(&UObject_ProcessEvent_original), true},
 			{"AShooterGameMode.Tick(float)", reinterpret_cast<LPVOID>(&Hook_AShooterGameMode_Tick),
 				reinterpret_cast<LPVOID*>(&AShooterGameMode_Tick_original), true},
 		};
@@ -1714,7 +1812,7 @@ namespace PerfGuard
 		QueryPerformanceFrequency(&f);
 		g_qpcFreq = f.QuadPart > 0 ? f.QuadPart : 1;
 
-		const bool wantTick = g_cfg.profilerEnabled || g_cfg.throttleEnabled;
+		const bool wantTick = g_cfg.profilerEnabled || g_cfg.throttleEnabled || g_cfg.bpEnabled;
 		const bool wantPrint = false; // PrintString hook removed: its native signature differs on current ARK builds
 		int ok = 0;
 		for (const auto& h : HookList())
@@ -2082,6 +2180,8 @@ namespace PerfGuard
 			{
 				g_lastReport = BuildReport(true);
 				Log::GetLog()->info("{}", g_lastReport);
+				if (g_tickHooksInstalled && g_cfg.bpEnabled)
+					Log::GetLog()->info("{}", BlueprintSummary(true));
 				if (g_tickHooksInstalled && g_cfg.profilerEnabled)
 					Log::GetLog()->info("{}", ProfileSummary(true));
 				if (g_cfg.mtEnabled)
@@ -2218,17 +2318,23 @@ namespace PerfGuard
 		Reply(conn, packet, s.str());
 	}
 
+	void RconBlueprints(RCONClientConnection* conn, RCONPacket* packet, UWorld*)
+	{
+		Reply(conn, packet, BlueprintSummary(false));
+	}
+
 	void RconHelp(RCONClientConnection* conn, RCONPacket* packet, UWorld*)
 	{
 		Reply(conn, packet,
 			"PerfGuard commands: perf.stats | perf.dinos | perf.cleanup | perf.rebaseline | perf.exec <cmd> | "
-			"perf.restart <minutes>|cancel | perf.reload | perf.profile");
+			"perf.restart <minutes>|cancel | perf.reload | perf.profile | perf.bp");
 	}
 
 	const std::vector<std::pair<const char*, void (*)(RCONClientConnection*, RCONPacket*, UWorld*)>> kRcon = {
 		{"perf.stats", &RconStats},       {"perf.dinos", &RconDinos},   {"perf.cleanup", &RconCleanup},
 		{"perf.rebaseline", &RconRebaseline}, {"perf.exec", &RconExec}, {"perf.restart", &RconRestart},
 		{"perf.reload", &RconReload},     {"perf.help", &RconHelp},       {"perf.profile", &RconProfile},
+		{"perf.bp", &RconBlueprints},
 	};
 } // namespace PerfGuard
 

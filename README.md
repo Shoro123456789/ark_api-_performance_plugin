@@ -35,6 +35,7 @@ An [AsaApi](https://github.com/ArkServerApi/AsaApi) plugin for ARK: Survival Asc
 | `perf.exec <cmd>` | Run any console command, e.g. `perf.exec a.ParallelAnimUpdate 1` |
 | `perf.restart <min>` / `perf.restart cancel` | Start or cancel a restart countdown |
 | `perf.reload` | Reload `config.json` and re-apply cvars |
+| `perf.bp` | Top Blueprint events by time per frame, with their asset path. Mods are Blueprint-only, so the path shows which mod a cost comes from |
 | `perf.profile` | Profiler breakdown, throttle counts, players online, idle state, blocked log messages |
 
 ## Measuring a change

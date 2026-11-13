@@ -133,6 +133,11 @@
     "Priority": 0,
     "AffinityMask": 0
   },
+  "BlueprintProfiler": {
+    "Enabled": true,
+    "SampleEvery": 16,
+    "TopN": 15
+  },
   "ExperimentalThreading": {
     "Enabled": false,
     "DinoActorTick": true,
