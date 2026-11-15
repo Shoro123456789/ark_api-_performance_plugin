@@ -37,6 +37,7 @@ An [AsaApi](https://github.com/ArkServerApi/AsaApi) plugin for ARK: Survival Asc
 | `perf.restart <min>` / `perf.restart cancel` | Start or cancel a restart countdown |
 | `perf.reload` | Reload `config.json` and re-apply cvars |
 | `perf.bp` | Top Blueprint events by time per frame, with their asset path. Mods are Blueprint-only, so the path shows which mod a cost comes from |
+| `perf.native start [seconds] [hz]` / `stop` / `perf.native` | Native sampler: briefly pauses the game thread many times a second, records which engine function it is in, and prints the top functions (self time and on-stack). Default 60 s at 20 Hz. Run it with players online. Nothing runs while it is off |
 | `perf.profile` | Profiler breakdown, throttle counts, players online, idle state, blocked log messages |
 
 ## Measuring a change

@@ -2291,6 +2291,7 @@ namespace PerfGuard
 			return;
 		}
 		++g_seconds;
+		g_gameThreadId = GetCurrentThreadId();
 
 		try
 		{
@@ -2456,11 +2457,314 @@ namespace PerfGuard
 		Reply(conn, packet, BlueprintSummary(false));
 	}
 
+	// ------------------------------------------------------------------------------------------------ native sampler
+	//
+	// Statistical profiler for the engine's native code. A helper thread briefly suspends the game thread, reads where
+	// it is executing (plus a cheap scan of its stack for return addresses), and resumes it. Addresses are mapped to
+	// function names with AsaApi's offsets cache. Off until `perf.native start`; nothing runs the rest of the time.
+	// The sampler thread never allocates or logs while the game thread is suspended (that could deadlock on a heap lock).
+
+	struct NativeSample
+	{
+		DWORD64 rip;
+		DWORD64 cand[10];
+		uint8 n;
+	};
+
+	std::atomic<bool> g_nsRunning{false};
+	std::atomic<DWORD> g_gameThreadId{0};
+	std::vector<NativeSample> g_nsSamples;
+	std::atomic<size_t> g_nsCount{0};
+	std::atomic<int> g_nsFailed{0};
+	std::string g_nsReport = "No native sample taken yet. Run: perf.native start 60";
+	HANDLE g_nsThread = nullptr;
+	int g_nsSeconds = 60, g_nsHz = 20;
+
+	bool LooksLikeReturnAddress(DWORD64 v)
+	{
+		const unsigned char* p = reinterpret_cast<const unsigned char*>(v);
+		if (p[-5] == 0xE8)
+			return true; // call rel32
+		if (p[-6] == 0xFF && (p[-5] == 0x15 || p[-5] == 0x95))
+			return true; // call [rip+x] / call [reg+x]
+		if (p[-2] == 0xFF && (p[-1] & 0xF8) == 0xD0)
+			return true; // call reg
+		if (p[-3] == 0x41 && p[-2] == 0xFF && (p[-1] & 0xF8) == 0xD0)
+			return true; // call r8-r15
+		return false;
+	}
+
+	// no C++ objects here: uses SEH to survive an unreadable address
+	void ScanStack(DWORD64 sp, DWORD64 lo, DWORD64 hi, NativeSample& s)
+	{
+		__try
+		{
+			const DWORD64* p = reinterpret_cast<const DWORD64*>(sp);
+			for (int i = 0; i < 640 && s.n < 10; ++i)
+			{
+				const DWORD64 v = p[i];
+				if (v > lo + 16 && v < hi && LooksLikeReturnAddress(v))
+					s.cand[s.n++] = v;
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+		}
+	}
+
+	struct SymTable
+	{
+		std::vector<std::pair<DWORD64, std::string>> syms; // sorted by offset from the module base
+		std::string source;
+	};
+
+	bool LoadSymTable(SymTable& out, DWORD64 base)
+	{
+		namespace fs = std::filesystem;
+		// the offset of a function we hook proves which cache belongs to this build
+		DWORD64 expect = 0;
+		try
+		{
+			expect = reinterpret_cast<DWORD64>(GetAddress(std::string("UWorld.Tick(ELevelTick,float)"))) - base;
+		}
+		catch (...)
+		{
+			return false;
+		}
+		for (const auto& bf : BitfieldCacheFiles())
+		{
+			const fs::path file = bf.parent_path() / "cached_offsets.cache";
+			std::ifstream in(file, std::ios::binary);
+			if (!in.good())
+				continue;
+			std::vector<std::pair<DWORD64, std::string>> syms;
+			bool matched = false;
+			while (true)
+			{
+				size_t klen = 0;
+				if (!in.read(reinterpret_cast<char*>(&klen), sizeof(klen)) || klen == 0 || klen > 4096)
+					break;
+				std::string key(klen, '\0');
+				intptr_t val = 0;
+				if (!in.read(key.data(), static_cast<std::streamsize>(klen)) || !in.read(reinterpret_cast<char*>(&val), sizeof(val)))
+					break;
+				if (key == "UWorld.Tick(ELevelTick,float)" && static_cast<DWORD64>(val) == expect)
+					matched = true;
+				if (val > 0x1000 && key.find('(') != std::string::npos)
+					syms.emplace_back(static_cast<DWORD64>(val), std::move(key));
+			}
+			if (!matched || syms.empty())
+				continue;
+			std::sort(syms.begin(), syms.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+			out.syms = std::move(syms);
+			out.source = file.string();
+			return true;
+		}
+		return false;
+	}
+
+	std::string ModuleNameOf(DWORD64 addr)
+	{
+		HMODULE m = nullptr;
+		if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				reinterpret_cast<LPCSTR>(addr), &m) || m == nullptr)
+			return "(unmapped code)";
+		char buf[MAX_PATH] = {};
+		if (GetModuleFileNameA(m, buf, MAX_PATH) == 0)
+			return "(module)";
+		std::string s(buf);
+		const auto slash = s.find_last_of("\\/");
+		return slash == std::string::npos ? s : s.substr(slash + 1);
+	}
+
+	void BuildNativeReport(size_t total, int seconds)
+	{
+		std::ostringstream out;
+		const DWORD64 base = reinterpret_cast<DWORD64>(GetModuleHandle(nullptr));
+		const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+		const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+		const DWORD64 hi = base + nt->OptionalHeader.SizeOfImage;
+
+		SymTable tab;
+		const bool haveSyms = LoadSymTable(tab, base);
+
+		auto resolve = [&](DWORD64 addr) -> std::string {
+			if (addr < base || addr >= hi)
+				return "[" + ModuleNameOf(addr) + "]";
+			const DWORD64 rva = addr - base;
+			if (!haveSyms)
+				return "game+0x" + std::to_string(rva);
+			auto it = std::upper_bound(tab.syms.begin(), tab.syms.end(), rva, [](DWORD64 v, const auto& s) { return v < s.first; });
+			if (it == tab.syms.begin())
+				return "game+0x" + std::to_string(rva);
+			--it;
+			const DWORD64 delta = rva - it->first;
+			if (delta > 0x3000)
+				return "(unnamed code near " + it->second + ")";
+			return it->second;
+		};
+
+		std::unordered_map<std::string, size_t> self, incl;
+		size_t inMain = 0;
+		for (size_t i = 0; i < total; ++i)
+		{
+			const NativeSample& s = g_nsSamples[i];
+			if (s.rip >= base && s.rip < hi)
+				++inMain;
+			const std::string selfName = resolve(s.rip);
+			++self[selfName];
+			std::set<std::string> seen{selfName};
+			for (uint8 k = 0; k < s.n; ++k)
+				seen.insert(resolve(s.cand[k]));
+			for (const auto& n : seen)
+				++incl[n];
+		}
+
+		auto top = [&](const std::unordered_map<std::string, size_t>& m, size_t n) {
+			std::vector<std::pair<std::string, size_t>> v(m.begin(), m.end());
+			std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+			std::ostringstream o;
+			for (size_t i = 0; i < v.size() && i < n; ++i)
+			{
+				char pct[16];
+				snprintf(pct, sizeof(pct), "%5.1f%%", total ? 100.0 * static_cast<double>(v[i].second) / static_cast<double>(total) : 0.0);
+				o << "  " << pct << "  " << v[i].first << "\n";
+			}
+			return o.str();
+		};
+
+		out << "Native sampler: " << total << " samples over " << seconds << " s (" << g_nsFailed.load() << " failed), "
+		    << inMain << " in the game module"
+		    << (haveSyms ? "" : ", NO symbol table matched this build (showing raw offsets)") << "\n";
+		if (total == 0)
+		{
+			out << "No usable samples. GetThreadContext may not work on the emulated game thread.";
+			g_nsReport = out.str();
+			return;
+		}
+		out << "Where the game thread was (self time):\n" << top(self, 25);
+		out << "Functions on the stack (inclusive, approximate):\n" << top(incl, 30);
+		g_nsReport = out.str();
+	}
+
+	DWORD WINAPI NativeSamplerProc(LPVOID)
+	{
+		const DWORD tid = g_gameThreadId.load();
+		HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+		if (h == nullptr)
+		{
+			g_nsReport = "Native sampler: could not open the game thread";
+			g_nsRunning = false;
+			return 1;
+		}
+		const DWORD64 base = reinterpret_cast<DWORD64>(GetModuleHandle(nullptr));
+		const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+		const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+		const DWORD64 hi = base + nt->OptionalHeader.SizeOfImage;
+
+		const DWORD sleepMs = static_cast<DWORD>((std::max)(1, 1000 / g_nsHz));
+		const ULONGLONG start = GetTickCount64();
+		const ULONGLONG end = start + static_cast<ULONGLONG>(g_nsSeconds) * 1000ULL;
+		const size_t cap = g_nsSamples.size();
+		while (g_nsRunning.load() && GetTickCount64() < end && g_nsCount.load() < cap)
+		{
+			Sleep(sleepMs);
+			if (SuspendThread(h) == static_cast<DWORD>(-1))
+			{
+				g_nsFailed.fetch_add(1);
+				continue;
+			}
+			CONTEXT ctx{};
+			ctx.ContextFlags = CONTEXT_CONTROL;
+			NativeSample s{};
+			const bool ok = GetThreadContext(h, &ctx) != 0;
+			if (ok)
+			{
+				s.rip = ctx.Rip;
+				ScanStack(ctx.Rsp, base, hi, s);
+			}
+			ResumeThread(h);
+			if (ok)
+				g_nsSamples[g_nsCount.fetch_add(1)] = s;
+			else
+				g_nsFailed.fetch_add(1);
+		}
+		CloseHandle(h);
+		const int secs = static_cast<int>((GetTickCount64() - start) / 1000ULL);
+		BuildNativeReport(g_nsCount.load(), secs);
+		Log::GetLog()->info("{}", g_nsReport);
+		g_nsRunning = false;
+		return 0;
+	}
+
+	std::string StartNativeSampler(int seconds, int hz)
+	{
+		if (g_nsRunning.load())
+			return "Native sampler already running";
+		if (g_gameThreadId.load() == 0)
+			return "Game thread not known yet";
+		g_nsSeconds = (std::min)(600, (std::max)(5, seconds));
+		g_nsHz = (std::min)(100, (std::max)(5, hz));
+		if (g_nsThread != nullptr)
+		{
+			WaitForSingleObject(g_nsThread, 5000);
+			CloseHandle(g_nsThread);
+			g_nsThread = nullptr;
+		}
+		g_nsSamples.assign(static_cast<size_t>(g_nsSeconds) * static_cast<size_t>(g_nsHz) + 16, NativeSample{});
+		g_nsCount = 0;
+		g_nsFailed = 0;
+		g_nsRunning = true;
+		g_nsThread = CreateThread(nullptr, 0, &NativeSamplerProc, nullptr, 0, nullptr);
+		if (g_nsThread == nullptr)
+		{
+			g_nsRunning = false;
+			return "Could not start the sampler thread";
+		}
+		return "Native sampler started: " + std::to_string(g_nsSeconds) + " s at " + std::to_string(g_nsHz) +
+		       " Hz. Play normally, then run `perf.native` for the result.";
+	}
+
+	void StopNativeSampler()
+	{
+		g_nsRunning = false;
+		if (g_nsThread != nullptr)
+		{
+			WaitForSingleObject(g_nsThread, 10000);
+			CloseHandle(g_nsThread);
+			g_nsThread = nullptr;
+		}
+	}
+
+	void RconNative(RCONClientConnection* conn, RCONPacket* packet, UWorld*)
+	{
+		g_gameThreadId = GetCurrentThreadId();
+		const std::string args = ArgsAfterCommand(packet);
+		if (args.rfind("start", 0) == 0)
+		{
+			int secs = 60, hz = 20;
+			std::istringstream is(args.substr(5));
+			is >> secs >> hz;
+			if (is.fail() && secs <= 0)
+				secs = 60;
+			if (hz <= 0)
+				hz = 20;
+			Reply(conn, packet, StartNativeSampler(secs, hz));
+		}
+		else if (args.rfind("stop", 0) == 0)
+		{
+			StopNativeSampler();
+			Reply(conn, packet, "Native sampler stopped.\n" + g_nsReport);
+		}
+		else
+			Reply(conn, packet, g_nsRunning.load() ? "Native sampler running: " + std::to_string(g_nsCount.load()) + " samples so far" : g_nsReport);
+	}
+
 	void RconHelp(RCONClientConnection* conn, RCONPacket* packet, UWorld*)
 	{
 		Reply(conn, packet,
 			"PerfGuard commands: perf.stats | perf.dinos | perf.cleanup | perf.rebaseline | perf.exec <cmd> | "
-			"perf.restart <minutes>|cancel | perf.reload | perf.profile | perf.bp");
+			"perf.restart <minutes>|cancel | perf.reload | perf.profile | perf.bp | perf.native start [seconds] [hz]|stop");
 	}
 
 	const std::vector<std::pair<const char*, void (*)(RCONClientConnection*, RCONPacket*, UWorld*)>> kRcon = {
@@ -2468,6 +2772,7 @@ namespace PerfGuard
 		{"perf.rebaseline", &RconRebaseline}, {"perf.exec", &RconExec}, {"perf.restart", &RconRestart},
 		{"perf.reload", &RconReload},     {"perf.help", &RconHelp},       {"perf.profile", &RconProfile},
 		{"perf.bp", &RconBlueprints},
+		{"perf.native", &RconNative},
 	};
 } // namespace PerfGuard
 
@@ -2493,6 +2798,7 @@ extern "C" __declspec(dllexport) void Plugin_Init()
 extern "C" __declspec(dllexport) void Plugin_Unload()
 {
 	using namespace PerfGuard;
+	StopNativeSampler();
 	{
 		const bool keep = g_cfg.mtEnabled;
 		g_cfg.mtEnabled = false;
