@@ -18,6 +18,13 @@
     "MaxRemovalsPerPass": 150,
     "ExcludeSpecies": []
   },
+  "NativeSampler": {
+    "AutoEnabled": true,
+    "IntervalMinutes": 30,
+    "SampleSeconds": 60,
+    "Hz": 20,
+    "LogTopSpecies": true
+  },
   "SpawnGate": {
     "Enabled": true,
     "MaxWild": 48000,

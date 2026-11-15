@@ -83,6 +83,13 @@ namespace PerfGuard
 		int maxRemovalsPerPass = 150;
 		std::vector<std::string> excludeSpecies;
 
+		// periodic logging (RCON is unreliable on some panels, so results can go to the log instead)
+		bool logTopSpecies = true;
+		bool nativeAutoEnabled = false;
+		int nativeAutoIntervalMinutes = 30;
+		int nativeAutoSeconds = 60;
+		int nativeAutoHz = 20;
+
 		// spawn gate: stops wild spawning once the population reaches a limit (nothing is deleted)
 		bool gateEnabled = false;
 		int gateMaxWild = 45000;
@@ -202,6 +209,13 @@ namespace PerfGuard
     "MaxRemovalsPerPass": 150,
     "ExcludeSpecies": []
   },
+  "NativeSampler": {
+    "AutoEnabled": false,
+    "IntervalMinutes": 30,
+    "SampleSeconds": 60,
+    "Hz": 20,
+    "LogTopSpecies": true
+  },
   "SpawnGate": {
     "Enabled": false,
     "MaxWild": 45000,
@@ -319,6 +333,15 @@ namespace PerfGuard
 			Read(j, "MinDistanceFromPlayers", c.minDistanceFromPlayers);
 			Read(j, "MaxRemovalsPerPass", c.maxRemovalsPerPass);
 			Read(j, "ExcludeSpecies", c.excludeSpecies);
+		}
+		if (root.contains("NativeSampler"))
+		{
+			const auto& j = root["NativeSampler"];
+			Read(j, "AutoEnabled", c.nativeAutoEnabled);
+			Read(j, "IntervalMinutes", c.nativeAutoIntervalMinutes);
+			Read(j, "SampleSeconds", c.nativeAutoSeconds);
+			Read(j, "Hz", c.nativeAutoHz);
+			Read(j, "LogTopSpecies", c.logTopSpecies);
 		}
 		if (root.contains("SpawnGate"))
 		{
@@ -440,6 +463,7 @@ namespace PerfGuard
 		c.autoHeadroomPercent = (std::max)(5, c.autoHeadroomPercent);
 		c.autoBaselineEndMinutes = (std::max)(c.autoBaselineStartMinutes + 1, c.autoBaselineEndMinutes);
 		c.gateMaxWild = (std::max)(1000, c.gateMaxWild);
+		c.nativeAutoIntervalMinutes = (std::max)(5, c.nativeAutoIntervalMinutes);
 		c.gateResumePercent = (std::min)(100, (std::max)(50, c.gateResumePercent));
 		c.gateScanSeconds = (std::max)(5, c.gateScanSeconds);
 		c.maxRemovalsPerPass = std::clamp(c.maxRemovalsPerPass, 1, 2000);
@@ -1684,6 +1708,7 @@ namespace PerfGuard
 		AShooterGameMode_Tick_original(self, dt);
 	}
 
+	std::atomic<DWORD> g_gameThreadId{0};
 	std::atomic<bool> g_gateClosed{false};
 	std::atomic<int> g_gateWild{0};
 	std::atomic<int64> g_gateBlocked{0};
@@ -2282,6 +2307,9 @@ namespace PerfGuard
 			g_cfg.capEnabled ? "on" : "off", g_cfg.cleanupEnabled ? "on" : "off", g_cfg.restartEnabled ? "on" : "off");
 	}
 
+	std::string StartNativeSampler(int seconds, int hz);
+	bool NativeSamplerBusy();
+
 	void OnSecond()
 	{
 		if (!g_serverReady)
@@ -2305,6 +2333,11 @@ namespace PerfGuard
 					Log::GetLog()->info("{}", ProfileSummary(true));
 				if (g_cfg.gateEnabled)
 					Log::GetLog()->info("{}", GateSummary());
+				if (g_cfg.logTopSpecies)
+				{
+					const Census sc = TakeCensus(World(), true);
+					Log::GetLog()->info("Top wild species: {}", TopSpecies(sc, 15));
+				}
 				if (g_cfg.mtEnabled)
 					Log::GetLog()->info("{}", ThreadingSummary());
 				if (g_cfg.throttleEnabled)
@@ -2318,6 +2351,9 @@ namespace PerfGuard
 					g_printBlocked = 0;
 				}
 			}
+			if (g_cfg.nativeAutoEnabled && g_playersOnline > 0 && !NativeSamplerBusy() &&
+				g_seconds % (g_cfg.nativeAutoIntervalMinutes * 60) == 0)
+				StartNativeSampler(g_cfg.nativeAutoSeconds, g_cfg.nativeAutoHz);
 			if (g_cfg.gateEnabled && g_seconds % g_cfg.gateScanSeconds == 0)
 				UpdateSpawnGate();
 			else if (!g_cfg.gateEnabled && g_gateClosed.load())
@@ -2472,7 +2508,6 @@ namespace PerfGuard
 	};
 
 	std::atomic<bool> g_nsRunning{false};
-	std::atomic<DWORD> g_gameThreadId{0};
 	std::vector<NativeSample> g_nsSamples;
 	std::atomic<size_t> g_nsCount{0};
 	std::atomic<int> g_nsFailed{0};
@@ -2696,6 +2731,8 @@ namespace PerfGuard
 		g_nsRunning = false;
 		return 0;
 	}
+
+	bool NativeSamplerBusy() { return g_nsRunning.load(); }
 
 	std::string StartNativeSampler(int seconds, int hz)
 	{
